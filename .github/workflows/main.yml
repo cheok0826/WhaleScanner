@@ -31,28 +31,29 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Run scanner -> data/latest.json
+      - name: Run whale scanner (write JSON snapshots)
         run: |
-          mkdir -p data
-          python -u scanner/whale_scanner.py \
+          python -u scanner/whale_scanner_actions.py \
             --auto-find \
             --top-n 200 \
-            --min-value 50000 \
+            --min-value 500000 \
             --active-days 14 \
             --mode active \
-            --rank-by risk \
-            --batch-size 10 \
-            --sleep 0.25 \
-            --output data/latest.json
+            --batch-size 20 \
+            --out-dir data \
+            --throttle 0.25 \
+            --timeout 12 \
+            --retries 2
 
-      - name: Commit updated JSON
+      - name: Commit & push data/*.json
         run: |
-          if git diff --quiet; then
-            echo "No changes"
+          git status --porcelain
+          git add data/*.json
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
             exit 0
           fi
-          git config user.name "whale-scan-bot"
+          git config user.name "whale-scanner-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add data/latest.json
-          git commit -m "Update whale scan data (latest.json)"
+          git commit -m "Update whale snapshots"
           git push

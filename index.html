@@ -38,71 +38,47 @@
   </header>
 
   <main>
-    <section id="controls">
-      <h2>Parameters</h2>
-      <div class="form-row">
-        <label for="addresses">Addresses (0x… list, one per line):</label>
-        <textarea id="addresses" placeholder="0xabc...\n0xdef..." rows="4"></textarea>
-      </div>
-      <div class="form-row">
-        <label for="autoDiscover">
-          <input type="checkbox" id="autoDiscover" checked />
-          Auto discover from leaderboard
-        </label>
-      </div>
-      <div class="form-row">
-        <label for="topN">Top N leaderboard entries:</label>
-        <input type="number" id="topN" min="1" max="500" value="200" />
-      </div>
-      <div class="form-row">
-        <label for="minValue">Minimum account value (USD):</label>
-        <input type="number" id="minValue" value="50000" />
-      </div>
-      <div class="form-row">
-        <label for="activeDays">Activity window (days):</label>
-        <input type="number" id="activeDays" value="14" />
-      </div>
-      <div class="form-row">
-        <label for="mode">Filter:</label>
-        <select id="mode">
-          <option value="active" selected>Active</option>
-          <option value="inactive">Inactive</option>
-        </select>
-      </div>
-      <div class="form-row">
-        <label for="rankBy">Rank by:</label>
-        <select id="rankBy">
-          <option value="risk" selected>Risk</option>
-          <option value="pnl">PnL</option>
-          <option value="stability">Stability</option>
-          <option value="conviction">Conviction</option>
-        </select>
-      </div>
-      <div class="form-row actions">
-        <button id="scanButton">Scan</button>
-        <button id="exportJson" disabled>Export JSON</button>
-      </div>
-      <div id="status" class="status"></div>
-    </section>
+    <div class="controls">
+  <select id="rankView">
+    <option value="risk">risk</option>
+    <option value="pnl">pnl</option>
+    <option value="stability">stability</option>
+    <option value="conviction">conviction</option>
+  </select>
 
-    <section id="results">
-      <h2>Results</h2>
-      <div class="table-container">
-        <table id="resultTable">
-          <thead>
-            <tr>
-              <th>Rank</th>
-              <th>Address</th>
-              <th>Account Value</th>
-              <th>Score</th>
-              <th>Style</th>
-              <th>Positions</th>
-            </tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      </div>
-    </section>
+  <input id="searchBox" placeholder="Search address…" />
+
+  <button id="refreshBtn">Reload snapshot</button>
+
+  <label>
+    <input type="checkbox" id="liveToggle" />
+    Live monitor selected
+  </label>
+
+  <label>
+    Interval (sec):
+    <input id="pollInterval" type="number" min="10" step="5" value="30" />
+  </label>
+
+  <span id="selectedCount">Selected: 0</span>
+</div>
+
+<table id="resultTable">
+  <thead>
+    <tr>
+      <th><input type="checkbox" id="selectAllVisible" /></th>
+      <th>Rank</th>
+      <th>Address</th>
+      <th>Snapshot Account</th>
+      <th>Live Account</th>
+      <th>Score</th>
+      <th>Style</th>
+      <th>Positions</th>
+    </tr>
+  </thead>
+  <tbody></tbody>
+</table>
+
   </main>
 
   <footer>
