@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Hyperliquid Whale Scanner</title>
+  <link rel="stylesheet" href="style.css" />
+  <!--
+    This static website implements a client‑side version of the Hyperliquid
+    whale scanner.  It uses the Hyperliquid public APIs to fetch account
+    and position data, computes risk and performance metrics, and displays
+    the results in a sortable table.  All requests are performed in
+    JavaScript using the Fetch API; no server component is required.
+
+    To host this site on GitHub Pages simply push these files to the
+    ``gh-pages`` branch of a repository.  Ensure that you enable GitHub
+    Pages for that branch in the repository settings.
+  -->
+</head>
+<body>
+  <header>
+    <h1>Hyperliquid Whale Scanner</h1>
+    <p>
+      Scan Hyperliquid wallets, rank them by risk, PnL, stability or
+      conviction, and explore their open positions directly in your
+      browser.  No backend or API keys required.
+    </p>
+  </header>
+
+  <main>
+    <section id="controls">
+      <h2>Parameters</h2>
+      <div class="form-row">
+        <label for="addresses">Addresses (0x… list, one per line):</label>
+        <textarea id="addresses" placeholder="0xabc...\n0xdef..." rows="4"></textarea>
+      </div>
+      <div class="form-row">
+        <label for="autoDiscover">
+          <input type="checkbox" id="autoDiscover" checked />
+          Auto discover from leaderboard
+        </label>
+      </div>
+      <div class="form-row">
+        <label for="topN">Top N leaderboard entries:</label>
+        <input type="number" id="topN" min="1" max="500" value="200" />
+      </div>
+      <div class="form-row">
+        <label for="minValue">Minimum account value (USD):</label>
+        <input type="number" id="minValue" value="50000" />
+      </div>
+      <div class="form-row">
+        <label for="activeDays">Activity window (days):</label>
+        <input type="number" id="activeDays" value="14" />
+      </div>
+      <div class="form-row">
+        <label for="mode">Filter:</label>
+        <select id="mode">
+          <option value="active" selected>Active</option>
+          <option value="inactive">Inactive</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label for="rankBy">Rank by:</label>
+        <select id="rankBy">
+          <option value="risk" selected>Risk</option>
+          <option value="pnl">PnL</option>
+          <option value="stability">Stability</option>
+          <option value="conviction">Conviction</option>
+        </select>
+      </div>
+      <div class="form-row actions">
+        <button id="scanButton">Scan</button>
+        <button id="exportJson" disabled>Export JSON</button>
+      </div>
+      <div id="status" class="status"></div>
+    </section>
+
+    <section id="results">
+      <h2>Results</h2>
+      <div class="table-container">
+        <table id="resultTable">
+          <thead>
+            <tr>
+              <th>Rank</th>
+              <th>Address</th>
+              <th>Account Value</th>
+              <th>Score</th>
+              <th>Style</th>
+              <th>Positions</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <p>
+      Built with ❤️ for the Hyperliquid community.  Data sourced from
+      public endpoints at <a href="https://hyperliquid.xyz" target="_blank">Hyperliquid</a>.
+    </p>
+  </footer>
+
+  <script src="script.js"></script>
+</body>
+</html>

@@ -1,0 +1,167 @@
+/* Basic styles for Hyperliquid Whale Scanner */
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  margin: 0;
+  padding: 0;
+  background: #f9f9fb;
+  color: #333;
+}
+
+header {
+  background: #1e1e2f;
+  color: #fff;
+  padding: 1rem 2rem;
+  text-align: center;
+}
+
+header h1 {
+  margin: 0 0 0.5rem;
+  font-size: 1.8rem;
+}
+
+header p {
+  margin: 0;
+  font-size: 1rem;
+  opacity: 0.8;
+}
+
+main {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 1rem;
+}
+
+section#controls {
+  background: #fff;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  padding: 1rem;
+  margin-bottom: 1.5rem;
+}
+
+section#controls h2 {
+  margin-top: 0;
+  font-size: 1.4rem;
+  border-bottom: 1px solid #eee;
+  padding-bottom: 0.5rem;
+}
+
+.form-row {
+  margin-bottom: 0.75rem;
+  display: flex;
+  flex-direction: column;
+}
+
+.form-row label {
+  font-weight: 500;
+  margin-bottom: 0.25rem;
+}
+
+.form-row input[type="number"], .form-row select, .form-row textarea {
+  padding: 0.4rem;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  font-size: 0.9rem;
+}
+
+.actions {
+  display: flex;
+  gap: 1rem;
+  margin-top: 0.5rem;
+}
+
+.actions button {
+  padding: 0.5rem 1rem;
+  font-size: 0.9rem;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.2s ease;
+}
+
+.actions button#scanButton {
+  background: #0077cc;
+  color: #fff;
+}
+
+.actions button#exportJson {
+  background: #00b36b;
+  color: #fff;
+}
+
+.actions button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.status {
+  margin-top: 0.5rem;
+  font-size: 0.9rem;
+  color: #555;
+}
+
+section#results h2 {
+  margin-top: 0;
+  font-size: 1.4rem;
+  margin-bottom: 0.5rem;
+}
+
+.table-container {
+  overflow-x: auto;
+  background: #fff;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+thead {
+  background: #f3f3f8;
+}
+
+th, td {
+  padding: 0.6rem;
+  border-bottom: 1px solid #eee;
+}
+
+th {
+  text-align: left;
+  font-weight: 600;
+  font-size: 0.85rem;
+}
+
+tr:nth-child(even) {
+  background: #fafafa;
+}
+
+details {
+  font-size: 0.8rem;
+}
+
+details ul {
+  list-style-type: disc;
+  padding-left: 1.2rem;
+  margin: 0.3rem 0;
+}
+
+footer {
+  background: #1e1e2f;
+  color: #fff;
+  text-align: center;
+  padding: 1rem;
+  margin-top: 2rem;
+  font-size: 0.8rem;
+}
+
+footer a {
+  color: #80b9ff;
+  text-decoration: none;
+}
+
+footer a:hover {
+  text-decoration: underline;
+}
