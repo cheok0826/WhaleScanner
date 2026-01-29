@@ -3,6 +3,16 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Content-Security-Policy" content="
+  default-src 'self';
+  script-src 'self';
+  style-src 'self' 'unsafe-inline';
+  connect-src https://api.hyperliquid.xyz https://stats-data.hyperliquid.xyz;
+  img-src 'self' data:;
+  object-src 'none';
+  base-uri 'self';
+">
+
   <title>Hyperliquid Whale Scanner</title>
   <link rel="stylesheet" href="style.css" />
   <!--
