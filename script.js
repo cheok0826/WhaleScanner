@@ -15,6 +15,10 @@
   // ----------------------------
   const INFO_URL = "https://api.hyperliquid.xyz/info";
   const LEADERBOARD_URL = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard";
+  const DEFAULT_RETRIES = 2;         // keep retries for normal calls
+  const GLOBAL_THROTTLE_MS = 400;    // slow down, fewer 429/500
+  const PER_WALLET_CONCURRENCY = 2;  // reduce parallel load
+  const BATCH_SIZE = 10;             // smaller batch tends to 500 less
 
   // ----------------------------
   // Tunables (safe defaults)
@@ -233,19 +237,21 @@
   // ----------------------------
   // Hyperliquid API wrappers
   // ----------------------------
-  async function postInfo(payload) {
+  async function postInfo(payload, cfg = {}) {
     return await fetchJsonWithRetry(
       INFO_URL,
       {
         method: "POST",
         mode: "cors",
         credentials: "omit",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       },
-      { retries: DEFAULT_RETRIES, timeoutMs: DEFAULT_TIMEOUT_MS }
+      {
+        retries: cfg.retries ?? DEFAULT_RETRIES,
+        timeoutMs: cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+        backoffBaseMs: cfg.backoffBaseMs ?? DEFAULT_BACKOFF_BASE_MS,
+      }
     );
   }
 
@@ -272,49 +278,61 @@
     const data = await postInfo({ type: "clearinghouseState", user, dex: "" });
     return data && typeof data === "object" ? data : null;
   }
-
+  
   async function fetchBatchClearinghouseStates(users, batchSize = BATCH_SIZE) {
     const states = {};
     const failed = [];
-
+  
     const parts = chunkArray(users, batchSize);
+  
     for (let idx = 0; idx < parts.length; idx++) {
       const part = parts[idx];
       setStatus(`📦 batchClearinghouseStates ${idx + 1}/${parts.length} ...`);
-
+  
       let resp = null;
+      let batchOk = false;
+  
+      // FAIL FAST on batch (prevents spammy repeated 500s)
       try {
-        resp = await postInfo({ type: "batchClearinghouseStates", users: part, dex: "" });
-      } catch (e) {
-        resp = null;
+        resp = await postInfo(
+          { type: "batchClearinghouseStates", users: part, dex: "" },
+          { retries: 0 }
+        );
+        batchOk = Array.isArray(resp) && resp.length === part.length;
+      } catch {
+        batchOk = false;
       }
-
-      // IMPORTANT: response is list aligned to input users order
-      if (Array.isArray(resp) && resp.length === part.length) {
+  
+      if (batchOk) {
         for (let i = 0; i < part.length; i++) {
           const addr = part[i];
           const st = resp[i];
           if (st && typeof st === "object") states[addr] = st;
           else failed.push(addr);
         }
-      } else {
-        // fallback per user
-        for (const addr of part) {
-          try {
-            const st = await fetchClearinghouseState(addr);
-            if (st) states[addr] = st;
-            else failed.push(addr);
-          } catch {
-            failed.push(addr);
-          }
+        continue;
+      }
+  
+      // Fallback per-user (usually survives when batch is flaky)
+      setStatus(`⚠️ batch failed, fallback per-user ${idx + 1}/${parts.length}...`);
+      for (const addr of part) {
+        try {
+          const st = await postInfo(
+            { type: "clearinghouseState", user: addr, dex: "" },
+            { retries: 2 }
+          );
+          if (st && typeof st === "object") states[addr] = st;
+          else failed.push(addr);
+        } catch {
+          failed.push(addr);
         }
       }
     }
-
-    // remove dup fails where later succeeded
+  
     const uniqueFailed = dedupeKeepOrder(failed).filter((a) => !states[a]);
     return { states, failed: uniqueFailed };
   }
+
 
   async function fetchUserFills(user) {
     const data = await postInfo({ type: "userFills", user });
@@ -962,3 +980,4 @@
     attachHandlers();
   }
 })();
+
