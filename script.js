@@ -636,7 +636,7 @@ function sleep(ms){
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 async function updateLive(){
-  const wallets = Array.from(state.selected);
+  const wallets = Array.from(state.selected).filter(Boolean);
 
   if (!wallets.length){
     state.live.states.clear();
@@ -646,96 +646,81 @@ async function updateLive(){
     return;
   }
 
-  // no overlap
-  if (state.live.loading) return;
+  // Share inflight promise (prevents overlap from poll + manual refresh)
+  if (state.live.inflight) return state.live.inflight;
 
-  state.live.loading = true;
-  setLiveStatus("Updating live data…");
+  state.live.inflight = (async () => {
+    state.live.loading = true;
+    setLiveStatus("Updating live data…");
 
-  let liveWarning = null;
+    let liveWarning = null;
+
+    try{
+      // 1) mids (non-fatal)
+      try{
+        state.live.mids = await hlPost({ type: "allMids", dex: "" });
+      }catch(err){
+        liveWarning = `failed to load mids (${err?.message || err})`;
+        state.live.mids = null;
+      }
+
+      // 2) states (batch with split-on-fail)
+      const results = new Map();
+
+      // start with max batches, then split only when needed
+      const MAX_BATCH = 60;
+      const queue = [];
+      for (let i = 0; i < wallets.length; i += MAX_BATCH){
+        queue.push(wallets.slice(i, i + MAX_BATCH));
+      }
+
+      while (queue.length){
+        const chunk = queue.shift();
+
+        try{
+          const resp = await hlPost({ type: "batchClearinghouseStates", users: chunk, dex: "" });
+
+          if (!Array.isArray(resp)){
+            throw new Error(`batchClearinghouseStates returned ${resp === null ? "null" : typeof resp}`);
+          }
+
+          for (let j = 0; j < chunk.length; j++){
+            results.set(chunk[j], resp[j] ?? null);
+          }
+        }catch(err){
+          // If batch fails: split chunk until size=1, then fallback to single-call
+          if (chunk.length > 1){
+            const mid = Math.ceil(chunk.length / 2);
+            queue.unshift(chunk.slice(mid), chunk.slice(0, mid)); // push halves to front
+          } else {
+            const w = chunk[0];
+            try{
+              const single = await hlPost({ type: "clearinghouseState", user: w, dex: "" });
+              results.set(w, single ?? null);
+            }catch(singleErr){
+              results.set(w, null);
+              liveWarning = singleErr?.message || String(singleErr);
+            }
+          }
+        }
+
+        await sleep(80);
+      }
+
+      state.live.states = results;
+      state.live.lastTs = Date.now();
+    } finally {
+      state.live.loading = false;
+      const t = state.live.lastTs ? new Date(state.live.lastTs).toLocaleTimeString() : "—";
+      setLiveStatus(`Live updated: ${t}${liveWarning ? ` (warning: ${liveWarning})` : ""}`);
+      renderWatchPanel();
+    }
+  })();
 
   try{
-    // 1) mids (non-fatal)
-    try{
-      const mids = await hlPost({ type: "allMids", dex: "" });
-      state.live.mids = mids;
-    }catch(err){
-      liveWarning = `failed to load mids (${err?.message || err})`;
-      state.live.mids = null;
-    }
-
-    // 2) states
-    const results = new Map();
-    let chunkSize = 60;
-    let idx = 0;
-
-    while (idx < wallets.length){
-      const chunk = wallets
-        .slice(idx, idx + chunkSize)
-        .map(normalizeWallet)
-        .filter(Boolean);
-
-      try{
-        const resp = await hlPost({ type: "batchClearinghouseStates", users: chunk, dex: "" });
-
-        // IMPORTANT: API can return null (valid per docs) or something unexpected
-        if (!Array.isArray(resp)){
-          throw new Error(`batchClearinghouseStates returned ${resp === null ? "null" : typeof resp}`);
-        }
-
-        // map by order; if resp shorter, fill missing with null
-        for (let j = 0; j < chunk.length; j++){
-          results.set(chunk[j], resp[j] ?? null);
-        }
-
-        idx += chunk.length;
-      }catch(err){
-        // If batch failed, try smaller chunks first
-        if (chunk.length > 1){
-          const smaller = Math.max(10, Math.floor(chunk.length / 2));
-          chunkSize = smaller;
-          await sleep(200);
-          continue;
-        }
-
-        // single fallback
-        const w = chunk[0];
-        try{
-          const single = await hlPost({ type: "clearinghouseState", user: w, dex: "" });
-          results.set(w, single ?? null);
-        }catch(singleErr){
-          results.set(w, null);
-          liveWarning = singleErr?.message || String(singleErr);
-        }
-
-        idx += 1;
-      }
-
-      await sleep(120);
-    }
-
-    // 3) second-pass fallback:
-    // if batch returned null items, try per-wallet clearinghouseState
-    // (common when address is agent wallet / inactive / unknown)
-    for (const [w, st] of results.entries()){
-      if (st) continue;
-      try{
-        const single = await hlPost({ type: "clearinghouseState", user: w, dex: "" });
-        results.set(w, single ?? null);
-      }catch(_){
-        // keep null
-      }
-      await sleep(80);
-    }
-
-    state.live.states = results;
-    state.live.lastTs = Date.now();
+    return await state.live.inflight;
   } finally {
-    state.live.loading = false;
-    const t = state.live.lastTs ? new Date(state.live.lastTs).toLocaleTimeString() : "—";
-    const warningText = liveWarning ? ` (warning: ${liveWarning})` : "";
-    setLiveStatus(`Live updated: ${t}${warningText}`);
-    renderWatchPanel();
+    state.live.inflight = null;
   }
 }
 function extractMarginSummary(st){
@@ -750,23 +735,37 @@ function extractMarginSummary(st){
   const totalNtlPos  = pickNum(ms, ["totalNtlPos", "totalNotional", "notional", "totalNtlPosUsd", "totalRawUsd"]);
   const marginUsed   = pickNum(ms, ["totalMarginUsed", "marginUsed", "margin_used", "totalMargin"]);
 
-  // maintenance is commonly top-level in your sample
   const maintenanceUsed = pickNum(st, ["crossMaintenanceMarginUsed", "maintenanceMarginUsed", "maintenance_used"]);
 
   const withdrawableTop = pickNum(st, ["withdrawable", "withdrawableUsd", "availableToWithdraw", "maxWithdrawable"]);
   const withdrawableMs  = pickNum(ms, ["withdrawable", "availableToWithdraw", "maxWithdrawable", "withdrawableUsd"]);
   const withdrawable = Number.isFinite(withdrawableTop) ? withdrawableTop : withdrawableMs;
 
-  const leverage = pickNum(ms, ["leverage", "crossLeverage"]);
-
-  const marginUsedPct =
+  // % of equity (can be >100)
+  const marginUsedPctEquity =
     (Number.isFinite(accountValue) && accountValue > 0 && Number.isFinite(marginUsed))
       ? (marginUsed / accountValue) * 100
       : NaN;
 
-  const maintenancePct =
+  // % of position value (gives implied leverage)
+  const marginUsedPctPos =
+    (Number.isFinite(totalNtlPos) && totalNtlPos > 0 && Number.isFinite(marginUsed))
+      ? (marginUsed / totalNtlPos) * 100
+      : NaN;
+
+  const effectiveLev =
+    (Number.isFinite(totalNtlPos) && totalNtlPos > 0 && Number.isFinite(marginUsed) && marginUsed > 0)
+      ? (totalNtlPos / marginUsed)
+      : NaN;
+
+  const maintenancePctEquity =
     (Number.isFinite(accountValue) && accountValue > 0 && Number.isFinite(maintenanceUsed))
       ? (maintenanceUsed / accountValue) * 100
+      : NaN;
+
+  const maintenancePctPos =
+    (Number.isFinite(totalNtlPos) && totalNtlPos > 0 && Number.isFinite(maintenanceUsed))
+      ? (maintenanceUsed / totalNtlPos) * 100
       : NaN;
 
   const exposureX =
@@ -779,11 +778,6 @@ function extractMarginSummary(st){
       ? (accountValue - marginUsed)
       : NaN;
 
-  const maintenanceBuffer =
-    (Number.isFinite(accountValue) && Number.isFinite(maintenanceUsed))
-      ? (accountValue - maintenanceUsed)
-      : NaN;
-
   return {
     ms,
     accountValue,
@@ -791,15 +785,19 @@ function extractMarginSummary(st){
     marginUsed,
     maintenanceUsed,
     withdrawable,
-    leverage,
 
-    marginUsedPct,
-    maintenancePct,
+    marginUsedPctEquity,
+    marginUsedPctPos,
+    effectiveLev,
+
+    maintenancePctEquity,
+    maintenancePctPos,
     exposureX,
+
     marginBuffer,
-    maintenanceBuffer,
   };
 }
+
 function extractPositions(st, mids){
   const aps = Array.isArray(st?.assetPositions) ? st.assetPositions : [];
   const out = [];
