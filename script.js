@@ -34,6 +34,37 @@ function toNum(v){
   return NaN;
 }
 
+function fmtPct(n, digits=2){
+  return Number.isFinite(n) ? `${n.toFixed(digits)}%` : "—";
+}
+function fmtX(n, digits=2){
+  return Number.isFinite(n) ? `${n.toFixed(digits)}x` : "—";
+}
+
+function summarizePositionSizes(st){
+  const aps = Array.isArray(st?.assetPositions) ? st.assetPositions : [];
+  const parts = [];
+
+  for (const ap of aps){
+    const p = ap?.position || ap;
+    if (!p) continue;
+
+    const coin = p.coin || p.symbol || p.asset || "";
+    const szi = toNum(p.szi ?? p.size ?? p.positionSize);
+    if (!coin || !Number.isFinite(szi) || szi === 0) continue;
+
+    const side = szi > 0 ? "LONG" : "SHORT";
+    const abs = Math.abs(szi);
+
+    // show fewer decimals for readability; adjust if you want
+    parts.push(`${coin} ${side} ${abs.toFixed(4)}`);
+  }
+
+  if (!parts.length) return "—";
+  if (parts.length <= 3) return parts.join(", ");
+  return `${parts.slice(0, 3).join(", ")} +${parts.length - 3} more`;
+}
+
 function fmtCompact(n, digits=2){
   if (!Number.isFinite(n)) return "—";
   const abs = Math.abs(n);
@@ -123,7 +154,6 @@ async function fetchJson(url){
   if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
   return await r.json();
 }
-
 async function hlPost(payload){
   const maxRetries = 3;
   let lastErr = null;
@@ -132,20 +162,21 @@ async function hlPost(payload){
     try{
       const r = await fetch(HL_INFO, {
         method: "POST",
-        mode: "cors",
         cache: "no-store",
-        headers: {
-          "content-type": "application/json",
-          "accept": "application/json",
-        },
+        headers: { "content-type": "application/json" },
         body: JSON.stringify(payload),
       });
 
-      if (r.ok) return await r.json();
+      const text = await r.text(); // read once
+      if (r.ok){
+        // some HL responses are JSON; parse safely
+        try { return JSON.parse(text); }
+        catch { return text; }
+      }
 
-      const text = await r.text();
       const retryable = r.status === 429 || r.status >= 500;
-      lastErr = new Error(`HL HTTP ${r.status}${text ? `: ${text}` : ""}`);
+      lastErr = new Error(`HL HTTP ${r.status}: ${text || "(empty body)"} | payload=${JSON.stringify(payload)}`);
+
       if (!retryable || attempt === maxRetries) throw lastErr;
 
       const delay = 400 * Math.pow(2, attempt) + Math.random() * 200;
@@ -153,6 +184,7 @@ async function hlPost(payload){
     }catch(err){
       lastErr = err;
       if (attempt === maxRetries) throw err;
+
       const delay = 400 * Math.pow(2, attempt) + Math.random() * 200;
       await new Promise(resolve => setTimeout(resolve, delay));
     }
@@ -189,7 +221,7 @@ const state = {
   pinned: new Set(),
 
   posSearch: "",
-  posSort: { key: "notional", dir: -1 }, // positions default: notional desc
+  posSort: { key: "posValueUsd", dir: -1 }, // positions default: notional desc
 
   live: {
     mids: null,
@@ -638,7 +670,10 @@ async function updateLive(){
     let idx = 0;
 
     while (idx < wallets.length){
-      const chunk = wallets.slice(idx, idx + chunkSize);
+      const chunk = wallets
+        .slice(idx, idx + chunkSize)
+        .map(normalizeWallet)
+        .filter(Boolean);
 
       try{
         const resp = await hlPost({ type: "batchClearinghouseStates", users: chunk, dex: "" });
@@ -703,7 +738,6 @@ async function updateLive(){
     renderWatchPanel();
   }
 }
-
 function extractMarginSummary(st){
   const ms =
     st?.marginSummary ||
@@ -712,24 +746,64 @@ function extractMarginSummary(st){
     st?.accountSummary ||
     null;
 
-  // accountValue + notional + margin used often in ms
   const accountValue = pickNum(ms, ["accountValue", "accountValueUsd", "account_value"]);
-  const totalNtlPos  = pickNum(ms, ["totalNtlPos", "totalNotional", "notional", "totalNtlPosUsd"]);
+  const totalNtlPos  = pickNum(ms, ["totalNtlPos", "totalNotional", "notional", "totalNtlPosUsd", "totalRawUsd"]);
   const marginUsed   = pickNum(ms, ["totalMarginUsed", "marginUsed", "margin_used", "totalMargin"]);
 
-  // withdrawable commonly at top-level "withdrawable"
+  // maintenance is commonly top-level in your sample
+  const maintenanceUsed = pickNum(st, ["crossMaintenanceMarginUsed", "maintenanceMarginUsed", "maintenance_used"]);
+
   const withdrawableTop = pickNum(st, ["withdrawable", "withdrawableUsd", "availableToWithdraw", "maxWithdrawable"]);
   const withdrawableMs  = pickNum(ms, ["withdrawable", "availableToWithdraw", "maxWithdrawable", "withdrawableUsd"]);
   const withdrawable = Number.isFinite(withdrawableTop) ? withdrawableTop : withdrawableMs;
 
   const leverage = pickNum(ms, ["leverage", "crossLeverage"]);
 
-  return { ms, accountValue, totalNtlPos, marginUsed, withdrawable, leverage };
-}
+  const marginUsedPct =
+    (Number.isFinite(accountValue) && accountValue > 0 && Number.isFinite(marginUsed))
+      ? (marginUsed / accountValue) * 100
+      : NaN;
 
+  const maintenancePct =
+    (Number.isFinite(accountValue) && accountValue > 0 && Number.isFinite(maintenanceUsed))
+      ? (maintenanceUsed / accountValue) * 100
+      : NaN;
+
+  const exposureX =
+    (Number.isFinite(accountValue) && accountValue > 0 && Number.isFinite(totalNtlPos))
+      ? (totalNtlPos / accountValue)
+      : NaN;
+
+  const marginBuffer =
+    (Number.isFinite(accountValue) && Number.isFinite(marginUsed))
+      ? (accountValue - marginUsed)
+      : NaN;
+
+  const maintenanceBuffer =
+    (Number.isFinite(accountValue) && Number.isFinite(maintenanceUsed))
+      ? (accountValue - maintenanceUsed)
+      : NaN;
+
+  return {
+    ms,
+    accountValue,
+    totalNtlPos,
+    marginUsed,
+    maintenanceUsed,
+    withdrawable,
+    leverage,
+
+    marginUsedPct,
+    maintenancePct,
+    exposureX,
+    marginBuffer,
+    maintenanceBuffer,
+  };
+}
 function extractPositions(st, mids){
   const aps = Array.isArray(st?.assetPositions) ? st.assetPositions : [];
   const out = [];
+
   for (const ap of aps){
     const p = ap?.position || ap;
     if (!p) continue;
@@ -745,26 +819,70 @@ function extractPositions(st, mids){
     const roeRaw = toNum(p.returnOnEquity ?? p.roe);
 
     const mark = toNum(mids?.[coin]);
-    const notional = Number.isFinite(mark) ? Math.abs(szi) * mark : toNum(p.positionValue ?? p.notional);
+
+    // Hyperliquid position USD value field is commonly "positionValue"
+    const posValueUsd = toNum(p.positionValue ?? p.notional ?? p.positionUsd ?? p.position_value_usd);
+
+    const marginUsed = toNum(p.marginUsed ?? p.margin_used);
 
     const side = szi > 0 ? "LONG" : "SHORT";
-    const roePct = Number.isFinite(roeRaw) ? roeRaw * 100 : NaN; // HL usually gives decimal
+    const roePct = Number.isFinite(roeRaw) ? roeRaw * 100 : NaN;
+
+    // liquidation distance (%): positive means how far away until liquidation
+    let liqDistPct = NaN;
+    if (Number.isFinite(mark) && mark > 0 && Number.isFinite(liqPx)){
+      liqDistPct = (szi > 0)
+        ? ((mark - liqPx) / mark) * 100
+        : ((liqPx - mark) / mark) * 100;
+    }
+
+    // uPnL as % of position value
+    const upnlPctValue =
+      (Number.isFinite(unrealizedPnl) && Number.isFinite(posValueUsd) && posValueUsd !== 0)
+        ? (unrealizedPnl / posValueUsd) * 100
+        : NaN;
+
+    // margin as % of position value (helpful to “feel” effective leverage on that leg)
+    const marginPctOfPos =
+      (Number.isFinite(marginUsed) && Number.isFinite(posValueUsd) && posValueUsd > 0)
+        ? (marginUsed / posValueUsd) * 100
+        : NaN;
 
     out.push({
       coin,
       side,
-      size: szi,
+
+      // Position Size (coin units)
+      size: szi,              // signed
+
       entryPx,
       markPx: mark,
-      notional,
+
+      // Position Value (USD)
+      posValueUsd,
+
       upnl: unrealizedPnl,
+      upnlPctValue,
+
       lev,
       liqPx,
+      liqDistPct,
+
       roePct,
+
+      marginUsed,
+      marginPctOfPos,
+
+      // funding (useful)
+      fundingAllTime: toNum(p.cumFunding?.allTime),
+      fundingSinceOpen: toNum(p.cumFunding?.sinceOpen),
     });
   }
+
   return out;
 }
+
+
 
 /* ---------- positions sorting ---------- */
 function posValue(r, key){
@@ -834,9 +952,13 @@ function renderWatchPanel(){
     const pinned = state.pinned.has(w);
     const pinCls = pinned ? "pinned" : "";
 
+    const muPct = msx.marginUsedPct;
     const badge =
-      Number.isFinite(msx.withdrawable) ? `<span class="badge ok">withdrawable ${esc(fmtUSD(msx.withdrawable))}</span>` :
-      `<span class="badge">watching</span>`;
+      Number.isFinite(muPct)
+        ? `<span class="badge ${muPct >= 90 ? "bad" : "ok"}">margin ${esc(fmtPct(muPct))}</span>`
+        : `<span class="badge">watching</span>`;
+
+    const posSizeSummary = summarizePositionSizes(st);
 
     return `
       <div class="card">
@@ -854,8 +976,37 @@ function renderWatchPanel(){
         <div class="card-body">
           <div class="kv">
             <div><div class="k">Account value</div><div class="v">${esc(fmtUSD(msx.accountValue))}</div></div>
-            <div><div class="k">Notional</div><div class="v">${esc(fmtUSD(msx.totalNtlPos))}</div></div>
-            <div><div class="k">Margin used</div><div class="v">${esc(fmtUSD(msx.marginUsed))}</div></div>
+
+            <!-- rename Notional -> Position Size -->
+            <div><div class="k">Position size</div><div class="v mono">${esc(posSizeSummary)}</div></div>
+
+            <!-- keep the USD exposure (very useful) -->
+            <div><div class="k">Position value</div><div class="v">${esc(fmtUSD(msx.totalNtlPos))}</div></div>
+
+            <div><div class="k">Exposure</div><div class="v mono">${esc(fmtX(msx.exposureX))}</div></div>
+
+            <!-- margin used as % (with USD included) -->
+            <div>
+              <div class="k">Margin used</div>
+              <div class="v mono">
+                ${esc(fmtPct(msx.marginUsedPct))} (${esc(fmtUSD(msx.marginUsed))})
+              </div>
+            </div>
+
+            <div>
+              <div class="k">Maint used</div>
+              <div class="v mono">
+                ${esc(fmtPct(msx.maintenancePct))} (${esc(fmtUSD(msx.maintenanceUsed))})
+              </div>
+            </div>
+
+            <div>
+              <div class="k">Buffer</div>
+              <div class="v mono" title="AccountValue - MarginUsed">
+                ${esc(fmtUSD(msx.marginBuffer))}
+              </div>
+            </div>
+
             <div><div class="k">Withdrawable</div><div class="v">${esc(fmtUSD(msx.withdrawable))}</div></div>
           </div>
         </div>
@@ -918,7 +1069,6 @@ function renderWatchPanel(){
   const sk = state.posSort.key;
   const sd = state.posSort.dir;
   posRows.sort((a,b)=> comparePos(posValue(a,sk), posValue(b,sk)) * sd);
-
   const head = `
     <thead>
       <tr>
@@ -926,13 +1076,17 @@ function renderWatchPanel(){
           ["wallet","Wallet"],
           ["coin","Coin"],
           ["side","Side"],
-          ["size","Size"],
+          ["size","Position Size"],          // renamed
           ["entryPx","Entry"],
           ["markPx","Mark"],
-          ["notional","Notional"],
+          ["posValueUsd","Position USD"],     // fixed (was notional)
           ["upnl","uPnL"],
+          ["upnlPctValue","uPnL%"],
           ["roePct","ROE%"],
           ["liqPx","Liq"],
+          ["liqDistPct","LiqDist%"],
+          ["marginUsed","Margin USD"],
+          ["marginPctOfPos","Margin%Pos"],
           ["lev","Lev"],
         ].map(([k,lab]) => {
           const arrow = (state.posSort.key === k) ? (state.posSort.dir === 1 ? " ▲" : " ▼") : "";
@@ -946,11 +1100,13 @@ function renderWatchPanel(){
     <tbody>
       ${posRows.map(r => {
         const short = r.wallet.slice(0,6) + "…" + r.wallet.slice(-4);
+
         const up = toNum(r.upnl);
         const upBadge =
-          Number.isFinite(up) ? (up >= 0 ? `<span class="badge ok">+${esc(fmtCompact(up,2))}</span>` : `<span class="badge bad">${esc(fmtCompact(up,2))}</span>`)
-          : `<span class="muted">—</span>`;
-        const roe = toNum(r.roePct);
+          Number.isFinite(up)
+            ? (up >= 0 ? `<span class="badge ok">+${esc(fmtCompact(up,2))}</span>` : `<span class="badge bad">${esc(fmtCompact(up,2))}</span>`)
+            : `<span class="muted">—</span>`;
+
         return `
           <tr>
             <td class="mono" title="${esc(r.wallet)}">${esc(short)}</td>
@@ -959,10 +1115,14 @@ function renderWatchPanel(){
             <td class="mono">${esc(fmtCompact(toNum(r.size), 4))}</td>
             <td class="mono">${esc(fmtCompact(toNum(r.entryPx), 4))}</td>
             <td class="mono">${esc(fmtCompact(toNum(r.markPx), 4))}</td>
-            <td>${esc(fmtUSD(toNum(r.notional)))}</td>
+            <td>${esc(fmtUSD(toNum(r.posValueUsd)))}</td>
             <td>${upBadge}</td>
-            <td class="mono">${Number.isFinite(roe) ? esc(roe.toFixed(2)) : "—"}</td>
+            <td class="mono">${esc(fmtPct(toNum(r.upnlPctValue), 2))}</td>
+            <td class="mono">${esc(fmtPct(toNum(r.roePct), 2))}</td>
             <td class="mono">${esc(fmtCompact(toNum(r.liqPx), 4))}</td>
+            <td class="mono">${esc(fmtPct(toNum(r.liqDistPct), 2))}</td>
+            <td>${esc(fmtUSD(toNum(r.marginUsed)))}</td>
+            <td class="mono">${esc(fmtPct(toNum(r.marginPctOfPos), 2))}</td>
             <td class="mono">${esc(fmtCompact(toNum(r.lev), 2))}</td>
           </tr>
         `;
