@@ -132,7 +132,12 @@ async function hlPost(payload){
     try{
       const r = await fetch(HL_INFO, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        mode: "cors",
+        cache: "no-store",
+        headers: {
+          "content-type": "application/json",
+          "accept": "application/json",
+        },
         body: JSON.stringify(payload),
       });
 
@@ -155,6 +160,7 @@ async function hlPost(payload){
 
   throw lastErr || new Error("HL request failed");
 }
+
 
 /* ---------- layout collapse ---------- */
 function setRankCollapsed(collapsed){
@@ -597,9 +603,9 @@ function setLiveStatus(text){
 function sleep(ms){
   return new Promise(resolve => setTimeout(resolve, ms));
 }
-
 async function updateLive(){
   const wallets = Array.from(state.selected);
+
   if (!wallets.length){
     state.live.states.clear();
     state.live.lastTs = null;
@@ -608,53 +614,86 @@ async function updateLive(){
     return;
   }
 
+  // no overlap
   if (state.live.loading) return;
+
   state.live.loading = true;
   setLiveStatus("Updating live data…");
+
   let liveWarning = null;
 
   try{
+    // 1) mids (non-fatal)
     try{
-      const mids = await hlPost({ type: "allMids" });
+      const mids = await hlPost({ type: "allMids", dex: "" });
       state.live.mids = mids;
     }catch(err){
       liveWarning = `failed to load mids (${err?.message || err})`;
       state.live.mids = null;
     }
 
-    const results = [];
+    // 2) states
+    const results = new Map();
     let chunkSize = 60;
     let idx = 0;
 
     while (idx < wallets.length){
       const chunk = wallets.slice(idx, idx + chunkSize);
+
       try{
-        const resp = await hlPost({ type: "batchClearinghouseStates", users: chunk });
-        for (let j=0; j<chunk.length; j++){
-          results.push([chunk[j], resp[j]]);
+        const resp = await hlPost({ type: "batchClearinghouseStates", users: chunk, dex: "" });
+
+        // IMPORTANT: API can return null (valid per docs) or something unexpected
+        if (!Array.isArray(resp)){
+          throw new Error(`batchClearinghouseStates returned ${resp === null ? "null" : typeof resp}`);
         }
+
+        // map by order; if resp shorter, fill missing with null
+        for (let j = 0; j < chunk.length; j++){
+          results.set(chunk[j], resp[j] ?? null);
+        }
+
         idx += chunk.length;
       }catch(err){
+        // If batch failed, try smaller chunks first
         if (chunk.length > 1){
-          const smaller = Math.max(1, Math.floor(chunk.length / 2));
-          chunkSize = Math.max(10, smaller);
+          const smaller = Math.max(10, Math.floor(chunk.length / 2));
+          chunkSize = smaller;
           await sleep(200);
           continue;
         }
 
+        // single fallback
+        const w = chunk[0];
         try{
-          const single = await hlPost({ type: "clearinghouseState", user: chunk[0] });
-          results.push([chunk[0], single]);
+          const single = await hlPost({ type: "clearinghouseState", user: w, dex: "" });
+          results.set(w, single ?? null);
         }catch(singleErr){
-          results.push([chunk[0], null]);
+          results.set(w, null);
           liveWarning = singleErr?.message || String(singleErr);
         }
+
         idx += 1;
       }
+
       await sleep(120);
     }
 
-    state.live.states = new Map(results);
+    // 3) second-pass fallback:
+    // if batch returned null items, try per-wallet clearinghouseState
+    // (common when address is agent wallet / inactive / unknown)
+    for (const [w, st] of results.entries()){
+      if (st) continue;
+      try{
+        const single = await hlPost({ type: "clearinghouseState", user: w, dex: "" });
+        results.set(w, single ?? null);
+      }catch(_){
+        // keep null
+      }
+      await sleep(80);
+    }
+
+    state.live.states = results;
     state.live.lastTs = Date.now();
   } finally {
     state.live.loading = false;
