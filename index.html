@@ -6,93 +6,125 @@
   <title>WhaleScanner Dashboard</title>
   <link rel="stylesheet" href="style.css" />
 </head>
-
 <body>
   <header class="topbar">
-    <div class="topbar__left">
+    <div class="topbar-left">
       <div class="brand">
-        <div class="brand__title">WhaleScanner</div>
-        <div class="brand__sub">Rankings + Live Watchlist</div>
+        <div class="brand-title">WhaleScanner</div>
+        <div class="brand-sub">Rankings + Live Positions</div>
       </div>
     </div>
 
-    <div class="topbar__right">
+    <div class="topbar-right">
       <div class="control">
-        <label for="datasetSelect">Dataset</label>
+        <label class="label">Dataset</label>
         <select id="datasetSelect"></select>
       </div>
 
-      <button id="reloadBtn" class="btn">Reload</button>
+      <div class="control grow">
+        <label class="label">Search</label>
+        <input id="rankSearch" type="search" placeholder="Search wallet / coin / any column..." />
+      </div>
 
-      <div class="meta" id="datasetMeta">—</div>
+      <div class="control">
+        <label class="label">Auto refresh</label>
+        <select id="pollInterval">
+          <option value="0">Off</option>
+          <option value="10">10s</option>
+          <option value="20" selected>20s</option>
+          <option value="30">30s</option>
+          <option value="60">60s</option>
+        </select>
+      </div>
+
+      <button id="btnRefresh" class="btn">Refresh</button>
+      <button id="btnFocus" class="btn btn-ghost" title="Collapse rankings and focus on positions">Focus</button>
+      <button id="btnCollapseRank" class="btn btn-ghost" title="Collapse/expand rankings panel">Toggle Rankings</button>
     </div>
   </header>
 
-  <main class="layout">
-    <section class="panel panel--main">
-      <div class="panel__header">
-        <div class="tabs" id="methodTabs"></div>
-
-        <div class="panel__tools">
-          <div class="control">
-            <label for="tableSearch">Search</label>
-            <input id="tableSearch" type="text" placeholder="address / coin / anything…" />
-          </div>
-
-          <div class="control">
-            <label for="pageSize">Rows</label>
-            <select id="pageSize">
-              <option value="25">25</option>
-              <option value="50" selected>50</option>
-              <option value="100">100</option>
-              <option value="250">250</option>
-              <option value="999999">All</option>
-            </select>
-          </div>
+  <main class="app" id="appRoot">
+    <!-- LEFT: Rankings -->
+    <section class="panel" id="rankPanel">
+      <div class="panel-head">
+        <div class="panel-title">
+          Rankings
+          <span class="muted" id="rankMeta"></span>
+        </div>
+        <div class="panel-actions">
+          <button id="btnColumns" class="btn btn-ghost">Columns</button>
+          <button id="btnClearSelection" class="btn btn-ghost">Clear selection</button>
         </div>
       </div>
 
-      <div class="panel__body">
-        <div id="tableWrap" class="tableWrap"></div>
-        <div id="tableFooter" class="tableFooter"></div>
+      <div class="panel-body">
+        <div class="hint">
+          Tip: click a row to toggle selection. Click column headers to sort.
+        </div>
+
+        <div class="table-wrap" id="rankTableWrap">
+          <table class="table" id="rankTable"></table>
+        </div>
       </div>
     </section>
 
-    <aside class="panel panel--watch">
-      <div class="panel__header">
-        <div>
-          <div class="panel__title">Watchlist</div>
-          <div class="panel__hint">Tick addresses in the table to watch them live.</div>
+    <!-- Splitter -->
+    <div class="splitter" id="splitter" title="Drag to resize panels"></div>
+
+    <!-- RIGHT: Watch / Positions -->
+    <section class="panel" id="watchPanel">
+      <div class="panel-head">
+        <div class="panel-title">
+          Selected wallets
+          <span class="muted" id="watchMeta"></span>
+        </div>
+        <div class="panel-actions">
+          <button id="btnRefreshLive" class="btn">Update live</button>
+          <button id="btnCollapseWatch" class="btn btn-ghost">Toggle Live</button>
+        </div>
+      </div>
+
+      <div class="panel-body" id="watchBody">
+        <div class="empty" id="watchEmpty">
+          No wallets selected yet. Select wallets from the rankings table (checkbox or row click).
         </div>
 
-        <div class="watch__controls">
-          <div class="control">
-            <label for="pollInterval">Poll (sec)</label>
-            <input id="pollInterval" type="number" min="5" step="1" value="20" />
+        <div class="cards" id="walletCards"></div>
+
+        <div class="section">
+          <div class="section-head">
+            <div class="section-title">Positions (all selected)</div>
+            <div class="section-actions">
+              <input id="posSearch" type="search" placeholder="Filter positions (wallet / coin / side...)" />
+            </div>
           </div>
-          <button id="watchToggleBtn" class="btn btn--primary">Start</button>
+
+          <div class="table-wrap table-wrap-tight">
+            <table class="table" id="posTable"></table>
+          </div>
         </div>
       </div>
+    </section>
 
-      <div class="panel__body">
-        <div class="watch__adder">
-          <input id="manualAddress" type="text" placeholder="Add address manually (0x...)" />
-          <button id="addAddressBtn" class="btn">Add</button>
-        </div>
-
-        <div id="watchStatus" class="watchStatus">Not running.</div>
-
-        <div id="watchlist" class="watchlist"></div>
+    <!-- Columns modal -->
+    <div class="modal-backdrop hidden" id="colModalBackdrop"></div>
+    <div class="modal hidden" id="colModal" role="dialog" aria-modal="true">
+      <div class="modal-head">
+        <div class="modal-title">Columns</div>
+        <button class="btn btn-ghost" id="btnCloseColumns">Close</button>
       </div>
-    </aside>
+      <div class="modal-body">
+        <div class="muted small">Choose which columns to show in Rankings.</div>
+        <div class="col-grid" id="colChecklist"></div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn btn-ghost" id="btnColsAll">All</button>
+        <button class="btn btn-ghost" id="btnColsNone">None</button>
+        <button class="btn" id="btnColsApply">Apply</button>
+      </div>
+    </div>
   </main>
 
-  <footer class="footer">
-    <div>
-      Live data uses Hyperliquid <code>/info</code> (<code>clearinghouseState</code>). :contentReference[oaicite:2]{index=2}
-    </div>
-  </footer>
-
-  <script type="module" src="script.js"></script>
+  <script src="script.js" defer></script>
 </body>
 </html>
