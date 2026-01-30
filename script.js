@@ -125,13 +125,35 @@ async function fetchJson(url){
 }
 
 async function hlPost(payload){
-  const r = await fetch(HL_INFO, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  if (!r.ok) throw new Error(`HL HTTP ${r.status}`);
-  return await r.json();
+  const maxRetries = 3;
+  let lastErr = null;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++){
+    try{
+      const r = await fetch(HL_INFO, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+
+      if (r.ok) return await r.json();
+
+      const text = await r.text();
+      const retryable = r.status === 429 || r.status >= 500;
+      lastErr = new Error(`HL HTTP ${r.status}${text ? `: ${text}` : ""}`);
+      if (!retryable || attempt === maxRetries) throw lastErr;
+
+      const delay = 400 * Math.pow(2, attempt) + Math.random() * 200;
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }catch(err){
+      lastErr = err;
+      if (attempt === maxRetries) throw err;
+      const delay = 400 * Math.pow(2, attempt) + Math.random() * 200;
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+
+  throw lastErr || new Error("HL request failed");
 }
 
 /* ---------- layout collapse ---------- */
@@ -480,6 +502,15 @@ function renderRankTable(){
   qs("rankMeta").textContent = `(${rows.length.toLocaleString()} shown)`;
 }
 
+function renderRankTableError(message){
+  const table = qs("rankTable");
+  table.innerHTML = `
+    <thead><tr><th>Rankings</th></tr></thead>
+    <tbody><tr><td class="muted">${esc(message)}</td></tr></tbody>
+  `;
+  qs("rankMeta").textContent = "(load failed)";
+}
+
 function syncSelectedRowStyles(){
   const table = qs("rankTable");
   table.querySelectorAll("tbody tr").forEach(tr => {
@@ -563,6 +594,10 @@ function setLiveStatus(text){
   qs("liveStatus").textContent = text || "";
 }
 
+function sleep(ms){
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 async function updateLive(){
   const wallets = Array.from(state.selected);
   if (!wallets.length){
@@ -576,19 +611,47 @@ async function updateLive(){
   if (state.live.loading) return;
   state.live.loading = true;
   setLiveStatus("Updating live data…");
+  let liveWarning = null;
 
   try{
-    const mids = await hlPost({ type: "allMids" });
-    state.live.mids = mids;
+    try{
+      const mids = await hlPost({ type: "allMids" });
+      state.live.mids = mids;
+    }catch(err){
+      liveWarning = `failed to load mids (${err?.message || err})`;
+      state.live.mids = null;
+    }
 
-    const CHUNK = 80;
     const results = [];
-    for (let i=0; i<wallets.length; i+=CHUNK){
-      const chunk = wallets.slice(i, i+CHUNK);
-      const resp = await hlPost({ type: "batchClearinghouseStates", users: chunk });
-      for (let j=0; j<chunk.length; j++){
-        results.push([chunk[j], resp[j]]);
+    let chunkSize = 60;
+    let idx = 0;
+
+    while (idx < wallets.length){
+      const chunk = wallets.slice(idx, idx + chunkSize);
+      try{
+        const resp = await hlPost({ type: "batchClearinghouseStates", users: chunk });
+        for (let j=0; j<chunk.length; j++){
+          results.push([chunk[j], resp[j]]);
+        }
+        idx += chunk.length;
+      }catch(err){
+        if (chunk.length > 1){
+          const smaller = Math.max(1, Math.floor(chunk.length / 2));
+          chunkSize = Math.max(10, smaller);
+          await sleep(200);
+          continue;
+        }
+
+        try{
+          const single = await hlPost({ type: "clearinghouseState", user: chunk[0] });
+          results.push([chunk[0], single]);
+        }catch(singleErr){
+          results.push([chunk[0], null]);
+          liveWarning = singleErr?.message || String(singleErr);
+        }
+        idx += 1;
       }
+      await sleep(120);
     }
 
     state.live.states = new Map(results);
@@ -596,7 +659,8 @@ async function updateLive(){
   } finally {
     state.live.loading = false;
     const t = state.live.lastTs ? new Date(state.live.lastTs).toLocaleTimeString() : "—";
-    setLiveStatus(`Live updated: ${t}`);
+    const warningText = liveWarning ? ` (warning: ${liveWarning})` : "";
+    setLiveStatus(`Live updated: ${t}${warningText}`);
     renderWatchPanel();
   }
 }
@@ -948,7 +1012,15 @@ async function loadDatasetById(id){
   if (!ds) throw new Error("No dataset found");
   state.datasetId = ds.id;
 
-  const data = await fetchJson(ds.file);
+  let data;
+  try{
+    data = await fetchJson(ds.file);
+  }catch(err){
+    const hint = location.protocol === "file:" ? "Tip: open index.html via a local web server (e.g. python -m http.server)." : "";
+    const msg = `Failed to load ${ds.file}. ${err?.message || err}. ${hint}`.trim();
+    renderRankTableError(msg);
+    throw err;
+  }
   state.rawData = data;
 
   const { meta, rows } = normalizeDatasetData(data);
@@ -1115,12 +1187,18 @@ async function init(){
   initSplitter();
   bindUI();
 
-  await loadManifest();
-  fillDatasetSelect();
-  await loadDatasetById(qs("datasetSelect").value);
+  try{
+    await loadManifest();
+    fillDatasetSelect();
+    await loadDatasetById(qs("datasetSelect").value);
 
-  await updateLive().catch(console.error);
-  startPolling();
+    await updateLive().catch(console.error);
+    startPolling();
+  }catch(err){
+    const hint = location.protocol === "file:" ? "Tip: open index.html via a local web server (e.g. python -m http.server)." : "";
+    renderRankTableError(`Unable to initialize datasets. ${err?.message || err}. ${hint}`.trim());
+    console.error(err);
+  }
 }
 
 document.addEventListener("DOMContentLoaded", init);
