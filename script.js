@@ -1,26 +1,35 @@
 /* WhaleScanner Dashboard (no deps)
- * - Loads rankings datasets (flatten nested keys -> filled columns)
- * - Search + sort
- * - Row click toggles checkbox
- * - Select wallets => live polling (batchClearinghouseStates) + positions table
- * - Resizable splitter + collapsible panels
+ * Adds:
+ * - independent searches (rankings + positions)
+ * - debounce for heavy tables
+ * - fixed collapse layout (rank-collapsed class)
+ * - live loading status + no overlapping polls
+ * - positions table sorting
+ * - manual add wallet (not from rankings)
+ * - pin wallet + copy wallet
  */
 
 const HL_INFO = "https://api.hyperliquid.xyz/info";
 
-// ---------- small utils ----------
 function qs(id){ return document.getElementById(id); }
 function esc(s){ return String(s ?? "").replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
 function clamp(n, a, b){ return Math.max(a, Math.min(b, n)); }
+
+function debounce(fn, ms){
+  let t = null;
+  return (...args) => {
+    if (t) clearTimeout(t);
+    t = setTimeout(() => fn(...args), ms);
+  };
+}
 
 function toNum(v){
   if (v == null) return NaN;
   if (typeof v === "number") return v;
   if (typeof v === "string"){
-    const x = Number(v);
+    const x = Number(v.replace(/,/g,"").trim());
     return Number.isFinite(x) ? x : NaN;
   }
-  // sometimes API gives { value: "123" }
   if (typeof v === "object" && v && "value" in v) return toNum(v.value);
   return NaN;
 }
@@ -38,17 +47,11 @@ function fmtCompact(n, digits=2){
   for (const u of units){
     if (abs >= u.v) return `${sign}${(abs/u.v).toFixed(digits)}${u.s}`;
   }
-  // small numbers
   if (abs >= 100) return `${sign}${abs.toFixed(0)}`;
   if (abs >= 1) return `${sign}${abs.toFixed(2)}`;
   return `${sign}${abs.toFixed(4)}`;
 }
-
 function fmtUSD(n){ return Number.isFinite(n) ? `$${fmtCompact(n, 2)}` : "—"; }
-function fmtPct(n){
-  if (!Number.isFinite(n)) return "—";
-  return `${(n*100).toFixed(2)}%`;
-}
 
 function pickNum(obj, keys){
   for (const k of keys){
@@ -66,7 +69,6 @@ function flatten(obj, prefix="", out={}){
     if (v && typeof v === "object" && !Array.isArray(v)){
       flatten(v, key, out);
     } else if (Array.isArray(v)){
-      // keep array length (often positions etc)
       out[`${key}.length`] = v.length;
     } else {
       out[key] = v;
@@ -75,22 +77,32 @@ function flatten(obj, prefix="", out={}){
   return out;
 }
 
+function normalizeWallet(s){
+  const t = String(s || "").trim();
+  if (!/^0x[a-fA-F0-9]{40}$/.test(t)) return null;
+  return t.toLowerCase();
+}
+
 function tryAddress(rowFlat){
   const candidates = [
     rowFlat.wallet, rowFlat.address, rowFlat.user, rowFlat.owner,
     rowFlat["wallet.address"], rowFlat["user.address"], rowFlat["account.address"],
     rowFlat["meta.wallet"], rowFlat["meta.address"],
   ].filter(Boolean);
-  if (candidates.length) return String(candidates[0]);
-  // last resort: find any field that looks like @ or 0x (but hyperliquid is 0x...)
-  for (const [k,v] of Object.entries(rowFlat)){
-    if (typeof v === "string" && v.startsWith("0x") && v.length >= 10) return v;
+  for (const c of candidates){
+    const w = normalizeWallet(c);
+    if (w) return w;
+  }
+  for (const v of Object.values(rowFlat)){
+    if (typeof v === "string" && v.startsWith("0x")){
+      const w = normalizeWallet(v);
+      if (w) return w;
+    }
   }
   return "";
 }
 
 function keyLabel(k){
-  // prettier header labels
   return k
     .replace(/^__/, "")
     .replace(/\.length$/," (len)")
@@ -100,7 +112,8 @@ function keyLabel(k){
 }
 
 async function fetchJson(url){
-  const r = await fetch(url, { cache: "no-store" });
+  const bust = url.includes("?") ? "&v=" : "?v=";
+  const r = await fetch(url + bust + Date.now(), { cache: "no-store" });
   if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
   return await r.json();
 }
@@ -115,74 +128,64 @@ async function hlPost(payload){
   return await r.json();
 }
 
-// ---------- app state ----------
+/* ---------- layout collapse ---------- */
+function setRankCollapsed(collapsed){
+  const root = qs("appRoot");
+  root.classList.toggle("rank-collapsed", !!collapsed);
+  localStorage.setItem("ws_rankCollapsed", collapsed ? "1" : "0");
+}
+function isRankCollapsed(){
+  return qs("appRoot").classList.contains("rank-collapsed");
+}
+
+/* ---------- state ---------- */
 const state = {
-  datasets: [],         // from manifest
+  datasets: [],
   datasetId: null,
-  rawData: null,        // loaded dataset json
-  rows: [],             // flattened rows
-  columns: [],          // all inferred columns
-  visibleCols: null,    // set of columns to show (persisted)
-  sort: { key: null, dir: 1 }, // dir 1 asc, -1 desc
+  rawData: null,
+
+  rows: [],
+  columns: [],
+  visibleCols: null,
+
+  sort: { key: null, dir: -1 }, // rankings
   search: "",
-  selected: new Set(),  // wallet addresses selected
+
+  selected: new Set(),
+  pinned: new Set(),
+
+  posSearch: "",
+  posSort: { key: "notional", dir: -1 }, // positions default: notional desc
+
   live: {
     mids: null,
-    states: new Map(),  // wallet -> clearinghouseState
+    states: new Map(),
     lastTs: null,
     timer: null,
     intervalSec: 20,
+    loading: false,
+    inflight: null,
   },
-  posSearch: "",
 };
 
-// ---------- manifest / dataset loading ----------
-async function loadManifest(){
-  // Recommended: data/manifest.json
-  // Fallback: try a few common names, else provide minimal default
-  const candidates = [
-    "data/manifest.json",
-    "data/index.json",
-    "data/files.json",
-  ];
+const LS_SELECTED = "ws_selected";
+const LS_PINNED   = "ws_pinned";
+const LS_DATASET  = "ws_datasetId";
+const LS_POLL     = "ws_poll";
 
-  for (const u of candidates){
-    try{
-      const m = await fetchJson(u);
-      const ds = normalizeManifest(m);
-      if (ds.length){
-        state.datasets = ds;
-        return;
-      }
-    }catch(_){}
-  }
-
-  // fallback (edit if you don’t use manifest yet)
-  state.datasets = [
-    { id: "rank_risk", title: "rank_risk", file: "data/rank_risk.json" },
-    { id: "rank_pnl",  title: "rank_pnl",  file: "data/rank_pnl.json" },
-  ];
-}
-
+/* ---------- manifest ---------- */
 function normalizeManifest(m){
-  // Accept:
-  // { datasets:[{id,title,file}] }
-  // or { files:["a.json","b.json"] }
-  // or ["a.json","b.json"]
   if (!m) return [];
   if (Array.isArray(m)){
-    return m
-      .filter(x => typeof x === "string" && x.endsWith(".json"))
+    return m.filter(x => typeof x === "string" && x.endsWith(".json"))
       .map(f => ({ id: f.replace(/\.json$/,""), title: f.replace(/\.json$/,""), file: `data/${f}` }));
   }
   if (Array.isArray(m.files)){
-    return m.files
-      .filter(f => typeof f === "string" && f.endsWith(".json"))
+    return m.files.filter(f => typeof f === "string" && f.endsWith(".json"))
       .map(f => ({ id: f.replace(/\.json$/,""), title: f.replace(/\.json$/,""), file: `data/${f}` }));
   }
   if (Array.isArray(m.datasets)){
-    return m.datasets
-      .filter(d => d && d.file)
+    return m.datasets.filter(d => d && d.file)
       .map(d => ({
         id: d.id || String(d.file).replace(/^.*\//,"").replace(/\.json$/,""),
         title: d.title || d.id || String(d.file).replace(/^.*\//,"").replace(/\.json$/,""),
@@ -192,13 +195,15 @@ function normalizeManifest(m){
   return [];
 }
 
+async function loadManifest(){
+  const m = await fetchJson("data/manifest.json");
+  const ds = normalizeManifest(m);
+  if (!ds.length) throw new Error("manifest.json has no datasets");
+  state.datasets = ds;
+}
+
+/* ---------- dataset parsing ---------- */
 function normalizeDatasetData(data){
-  // Accept:
-  // - array of rows
-  // - { rows:[...] }
-  // - { data:[...] }
-  // - { items:[...] }
-  // also keep metadata if present
   if (Array.isArray(data)) return { meta: {}, rows: data };
   if (data && typeof data === "object"){
     const rows =
@@ -216,7 +221,7 @@ function normalizeDatasetData(data){
 
 function inferColumns(rowsFlat){
   const freq = new Map();
-  for (const r of rowsFlat.slice(0, 400)){
+  for (const r of rowsFlat.slice(0, 500)){
     for (const k of Object.keys(r)){
       if (k.startsWith("__")) continue;
       freq.set(k, (freq.get(k) || 0) + 1);
@@ -224,23 +229,16 @@ function inferColumns(rowsFlat){
   }
 
   const priority = [
-    "__check",
-    "__rank",
-    "__wallet",
-    "wallet","address","user",
+    "__check","__rank","__wallet",
     "accountValue","metrics.accountValue","marginSummary.accountValue",
     "riskScore","metrics.riskScore","risk_score",
-    "pnl","pnlPct","pnlPercent","roi","winRate",
+    "pnl","pnlPct","roi",
     "lastTradeTime","lastTradeTs",
-    "positions.length","assetPositions.length",
-    "openPositions","numPositions",
+    "positions.length","assetPositions.length"
   ];
 
-  const all = Array.from(freq.entries())
-    .sort((a,b)=> b[1]-a[1])
-    .map(([k])=>k);
+  const all = Array.from(freq.entries()).sort((a,b)=> b[1]-a[1]).map(([k])=>k);
 
-  // Keep many columns (table scroll handles it)
   const chosen = [];
   const set = new Set();
   for (const k of priority){
@@ -250,7 +248,7 @@ function inferColumns(rowsFlat){
     if (set.has(k)) continue;
     chosen.push(k);
     set.add(k);
-    if (chosen.length >= 34) break;
+    if (chosen.length >= 36) break;
   }
   return chosen;
 }
@@ -264,9 +262,7 @@ function loadVisibleColsFromStorage(datasetId, columns){
     if (!Array.isArray(arr)) return null;
     const valid = arr.filter(c => columns.includes(c));
     return new Set(valid);
-  }catch(_){
-    return null;
-  }
+  }catch(_){ return null; }
 }
 
 function saveVisibleColsToStorage(datasetId, visibleSet){
@@ -274,7 +270,7 @@ function saveVisibleColsToStorage(datasetId, visibleSet){
   localStorage.setItem(key, JSON.stringify(Array.from(visibleSet)));
 }
 
-// ---------- rankings rendering ----------
+/* ---------- rankings table ---------- */
 function getCellValue(row, col){
   if (col === "__wallet") return row.__wallet || "";
   if (col === "__rank") return row.__rank ?? "";
@@ -285,17 +281,13 @@ function getCellValue(row, col){
 function formatCell(v){
   if (v == null) return `<span class="muted">—</span>`;
   if (typeof v === "number"){
-    // show raw for small, compact for big
     if (!Number.isFinite(v)) return `<span class="muted">—</span>`;
-    if (Math.abs(v) >= 1000) return esc(fmtCompact(v, 2));
-    return esc(String(v));
+    return esc(Math.abs(v) >= 1000 ? fmtCompact(v, 2) : String(v));
   }
   if (typeof v === "boolean") return v ? "true" : "false";
   if (typeof v === "string"){
-    // if looks like number, keep it but prettify
     const n = toNum(v);
-    if (Number.isFinite(n) && String(v).trim() !== "") return esc(fmtCompact(n, 2));
-    // long string -> ellipsis
+    if (Number.isFinite(n) && v.trim() !== "") return esc(fmtCompact(n, 2));
     const s = v.length > 72 ? v.slice(0, 68) + "…" : v;
     return `<span title="${esc(v)}">${esc(s)}</span>`;
   }
@@ -303,16 +295,10 @@ function formatCell(v){
 }
 
 function compareValues(a, b){
-  // numeric sort if possible
-  const na = toNum(a);
-  const nb = toNum(b);
-  const aNum = Number.isFinite(na);
-  const bNum = Number.isFinite(nb);
+  const na = toNum(a), nb = toNum(b);
+  const aNum = Number.isFinite(na), bNum = Number.isFinite(nb);
   if (aNum && bNum) return na - nb;
-
-  const sa = (a == null) ? "" : String(a);
-  const sb = (b == null) ? "" : String(b);
-  return sa.localeCompare(sb);
+  return String(a ?? "").localeCompare(String(b ?? ""));
 }
 
 function filteredSortedRows(){
@@ -321,14 +307,12 @@ function filteredSortedRows(){
 
   if (q){
     out = out.filter(r => {
-      // quick check: wallet + a few common keys
       if ((r.__wallet || "").toLowerCase().includes(q)) return true;
       for (const k of state.columns){
         if (k === "__check") continue;
         const v = getCellValue(r, k);
         if (v == null) continue;
-        const s = String(v).toLowerCase();
-        if (s.includes(q)) return true;
+        if (String(v).toLowerCase().includes(q)) return true;
       }
       return false;
     });
@@ -337,12 +321,7 @@ function filteredSortedRows(){
   if (state.sort.key){
     const k = state.sort.key;
     const dir = state.sort.dir;
-    out = [...out].sort((r1,r2)=> {
-      const v1 = getCellValue(r1, k);
-      const v2 = getCellValue(r2, k);
-      const c = compareValues(v1, v2);
-      return c * dir;
-    });
+    out = [...out].sort((r1,r2)=> compareValues(getCellValue(r1,k), getCellValue(r2,k)) * dir);
   }
 
   return out;
@@ -356,14 +335,12 @@ function renderRankTable(){
     ? state.columns.filter(c => state.visibleCols.has(c))
     : state.columns;
 
-  // Always keep checkbox + wallet visible
   const cols = [];
   cols.push("__check");
-  if (!visible.includes("__rank")) cols.push("__rank");
+  cols.push("__rank");
   cols.push("__wallet");
   for (const c of visible){
-    if (c === "__check" || c === "__wallet") continue;
-    if (c === "__rank") continue; // already
+    if (c === "__check" || c === "__wallet" || c === "__rank") continue;
     cols.push(c);
   }
 
@@ -374,9 +351,7 @@ function renderRankTable(){
           const lbl = (c === "__check") ? "" : keyLabel(c);
           const arrow = (state.sort.key === c) ? (state.sort.dir === 1 ? " ▲" : " ▼") : "";
           const noSort = (c === "__check");
-          return `<th data-col="${esc(c)}" ${noSort ? 'style="cursor:default"' : ""}>
-            ${esc(lbl)}${esc(arrow)}
-          </th>`;
+          return `<th data-col="${esc(c)}" ${noSort ? 'style="cursor:default"' : ""}>${esc(lbl)}${esc(arrow)}</th>`;
         }).join("")}
       </tr>
     </thead>
@@ -388,23 +363,20 @@ function renderRankTable(){
         const w = r.__wallet || "";
         const checked = state.selected.has(w);
         const trCls = checked ? "selected" : "";
+        const short = w ? (w.slice(0, 6) + "…" + w.slice(-4)) : "";
         return `
           <tr class="${trCls}" data-wallet="${esc(w)}">
             ${cols.map(c => {
               if (c === "__check"){
-                return `<td>
-                  <input type="checkbox" class="rowcheck" ${checked ? "checked" : ""} aria-label="select wallet" />
-                </td>`;
+                return `<td><input type="checkbox" class="rowcheck" ${checked ? "checked" : ""} aria-label="select wallet" /></td>`;
               }
               if (c === "__wallet"){
-                const short = w ? (w.slice(0, 6) + "…" + w.slice(-4)) : "";
                 return `<td class="mono" title="${esc(w)}">${esc(short || "—")}</td>`;
               }
               if (c === "__rank"){
                 return `<td class="muted">${esc(String(r.__rank ?? (idx+1)))}</td>`;
               }
-              const v = getCellValue(r, c);
-              return `<td>${formatCell(v)}</td>`;
+              return `<td>${formatCell(getCellValue(r,c))}</td>`;
             }).join("")}
           </tr>
         `;
@@ -414,18 +386,17 @@ function renderRankTable(){
 
   table.innerHTML = head + body;
 
-  // Header sort
   table.querySelectorAll("thead th").forEach(th => {
     const col = th.getAttribute("data-col");
     if (!col || col === "__check") return;
     th.addEventListener("click", () => {
       if (state.sort.key === col) state.sort.dir *= -1;
-      else { state.sort.key = col; state.sort.dir = -1; } // default: descending
+      else { state.sort.key = col; state.sort.dir = -1; }
       renderRankTable();
     });
   });
 
-  // Row click toggles checkbox (except click on inputs/links)
+  // Row click toggles checkbox
   table.querySelectorAll("tbody tr").forEach(tr => {
     tr.addEventListener("click", (e) => {
       if (e.target.closest("input") || e.target.closest("a") || e.target.closest("button")) return;
@@ -434,7 +405,6 @@ function renderRankTable(){
     });
   });
 
-  // Checkbox events
   table.querySelectorAll("input.rowcheck").forEach(cb => {
     cb.addEventListener("click", (e) => {
       e.stopPropagation();
@@ -442,7 +412,11 @@ function renderRankTable(){
       const wallet = tr?.getAttribute("data-wallet") || "";
       if (!wallet) return;
       if (cb.checked) state.selected.add(wallet);
-      else state.selected.delete(wallet);
+      else {
+        state.selected.delete(wallet);
+        state.pinned.delete(wallet); // keep pinned clean
+        persistPinned();
+      }
       persistSelected();
       syncSelectedRowStyles();
       onSelectionChanged();
@@ -463,12 +437,13 @@ function syncSelectedRowStyles(){
   });
 }
 
+/* ---------- columns modal ---------- */
 function openColumnsModal(){
   const backdrop = qs("colModalBackdrop");
   const modal = qs("colModal");
   const list = qs("colChecklist");
 
-  const cols = state.columns.filter(c => c !== "__check"); // keep check special
+  const cols = state.columns.filter(c => c !== "__check");
   const visible = state.visibleCols || new Set(cols);
 
   list.innerHTML = cols.map(c => {
@@ -486,77 +461,93 @@ function openColumnsModal(){
   backdrop.classList.remove("hidden");
   modal.classList.remove("hidden");
 }
-
 function closeColumnsModal(){
   qs("colModalBackdrop").classList.add("hidden");
   qs("colModal").classList.add("hidden");
 }
-
 function applyColumnsFromModal(){
   const checks = Array.from(qs("colChecklist").querySelectorAll("input[type=checkbox]"));
   const visible = new Set();
   for (const cb of checks){
     const col = cb.getAttribute("data-col");
-    if (!col) continue;
-    if (cb.checked) visible.add(col);
+    if (col && cb.checked) visible.add(col);
   }
-  // always keep these
-  visible.add("__wallet");
-  visible.add("__rank");
+  visible.add("__wallet"); visible.add("__rank");
   state.visibleCols = visible;
   saveVisibleColsToStorage(state.datasetId, visible);
   closeColumnsModal();
   renderRankTable();
 }
 
-// ---------- selection persistence ----------
+/* ---------- persistence ---------- */
 function persistSelected(){
-  localStorage.setItem("ws_selected", JSON.stringify(Array.from(state.selected)));
+  localStorage.setItem(LS_SELECTED, JSON.stringify(Array.from(state.selected)));
 }
 function loadSelected(){
   try{
-    const raw = localStorage.getItem("ws_selected");
+    const raw = localStorage.getItem(LS_SELECTED);
     if (!raw) return;
     const arr = JSON.parse(raw);
-    if (Array.isArray(arr)){
-      state.selected = new Set(arr.filter(Boolean));
-    }
+    if (Array.isArray(arr)) state.selected = new Set(arr.map(normalizeWallet).filter(Boolean));
   }catch(_){}
 }
 
-// ---------- live positions ----------
+function persistPinned(){
+  localStorage.setItem(LS_PINNED, JSON.stringify(Array.from(state.pinned)));
+}
+function loadPinned(){
+  try{
+    const raw = localStorage.getItem(LS_PINNED);
+    if (!raw) return;
+    const arr = JSON.parse(raw);
+    if (Array.isArray(arr)) state.pinned = new Set(arr.map(normalizeWallet).filter(Boolean));
+  }catch(_){}
+}
+
+/* ---------- live update (with guard + loading UI) ---------- */
+function setLiveStatus(text){
+  qs("liveStatus").textContent = text || "";
+}
+
 async function updateLive(){
   const wallets = Array.from(state.selected);
   if (!wallets.length){
     state.live.states.clear();
     state.live.lastTs = null;
+    state.live.mids = null;
     renderWatchPanel();
     return;
   }
 
-  // fetch mids once per refresh
-  const mids = await hlPost({ type: "allMids" });
-  state.live.mids = mids;
+  if (state.live.loading) return;
+  state.live.loading = true;
+  setLiveStatus("Updating live data…");
 
-  // batch states (chunk to be safe)
-  const CHUNK = 80;
-  const results = [];
-  for (let i=0; i<wallets.length; i+=CHUNK){
-    const chunk = wallets.slice(i, i+CHUNK);
-    const resp = await hlPost({ type: "batchClearinghouseStates", users: chunk });
-    // response is ordered list (same as chunk)
-    for (let j=0; j<chunk.length; j++){
-      results.push([chunk[j], resp[j]]);
+  try{
+    const mids = await hlPost({ type: "allMids" });
+    state.live.mids = mids;
+
+    const CHUNK = 80;
+    const results = [];
+    for (let i=0; i<wallets.length; i+=CHUNK){
+      const chunk = wallets.slice(i, i+CHUNK);
+      const resp = await hlPost({ type: "batchClearinghouseStates", users: chunk });
+      for (let j=0; j<chunk.length; j++){
+        results.push([chunk[j], resp[j]]);
+      }
     }
-  }
 
-  state.live.states = new Map(results);
-  state.live.lastTs = Date.now();
-  renderWatchPanel();
+    state.live.states = new Map(results);
+    state.live.lastTs = Date.now();
+  } finally {
+    state.live.loading = false;
+    const t = state.live.lastTs ? new Date(state.live.lastTs).toLocaleTimeString() : "—";
+    setLiveStatus(`Live updated: ${t}`);
+    renderWatchPanel();
+  }
 }
 
 function extractMarginSummary(st){
-  // Hyperliquid can change shape; try multiple likely places/keys.
   const ms =
     st?.marginSummary ||
     st?.crossMarginSummary ||
@@ -564,11 +555,17 @@ function extractMarginSummary(st){
     st?.accountSummary ||
     null;
 
+  // accountValue + notional + margin used often in ms
   const accountValue = pickNum(ms, ["accountValue", "accountValueUsd", "account_value"]);
   const totalNtlPos  = pickNum(ms, ["totalNtlPos", "totalNotional", "notional", "totalNtlPosUsd"]);
   const marginUsed   = pickNum(ms, ["totalMarginUsed", "marginUsed", "margin_used", "totalMargin"]);
-  const withdrawable = pickNum(ms, ["withdrawable", "availableToWithdraw", "maxWithdrawable", "withdrawableUsd"]);
-  const leverage     = pickNum(ms, ["leverage", "crossLeverage"]);
+
+  // withdrawable commonly at top-level "withdrawable"
+  const withdrawableTop = pickNum(st, ["withdrawable", "withdrawableUsd", "availableToWithdraw", "maxWithdrawable"]);
+  const withdrawableMs  = pickNum(ms, ["withdrawable", "availableToWithdraw", "maxWithdrawable", "withdrawableUsd"]);
+  const withdrawable = Number.isFinite(withdrawableTop) ? withdrawableTop : withdrawableMs;
+
+  const leverage = pickNum(ms, ["leverage", "crossLeverage"]);
 
   return { ms, accountValue, totalNtlPos, marginUsed, withdrawable, leverage };
 }
@@ -580,16 +577,21 @@ function extractPositions(st, mids){
     const p = ap?.position || ap;
     if (!p) continue;
 
-    const coin = p.coin || p.symbol || p.asset || p.name || "";
+    const coin = p.coin || p.symbol || p.asset || "";
     const szi = toNum(p.szi ?? p.size ?? p.positionSize);
     if (!Number.isFinite(szi) || szi === 0) continue;
 
     const entryPx = toNum(p.entryPx ?? p.entryPrice);
     const unrealizedPnl = toNum(p.unrealizedPnl ?? p.upnl ?? p.pnlUnrealized ?? p.pnl);
     const lev = toNum(p.leverage?.value ?? p.leverage);
+    const liqPx = toNum(p.liquidationPx ?? p.liqPx ?? p.liquidation_price);
+    const roeRaw = toNum(p.returnOnEquity ?? p.roe);
+
     const mark = toNum(mids?.[coin]);
     const notional = Number.isFinite(mark) ? Math.abs(szi) * mark : toNum(p.positionValue ?? p.notional);
+
     const side = szi > 0 ? "LONG" : "SHORT";
+    const roePct = Number.isFinite(roeRaw) ? roeRaw * 100 : NaN; // HL usually gives decimal
 
     out.push({
       coin,
@@ -600,9 +602,42 @@ function extractPositions(st, mids){
       notional,
       upnl: unrealizedPnl,
       lev,
+      liqPx,
+      roePct,
     });
   }
   return out;
+}
+
+/* ---------- positions sorting ---------- */
+function posValue(r, key){
+  if (key === "wallet") return r.wallet;
+  return r[key];
+}
+function comparePos(a, b){
+  const na = toNum(a), nb = toNum(b);
+  const aNum = Number.isFinite(na), bNum = Number.isFinite(nb);
+  if (aNum && bNum) return na - nb;
+  return String(a ?? "").localeCompare(String(b ?? ""));
+}
+
+/* ---------- watch panel render (pins + copy) ---------- */
+async function copyText(text){
+  try{
+    await navigator.clipboard.writeText(text);
+    setLiveStatus("Copied wallet.");
+    setTimeout(() => setLiveStatus(""), 1200);
+  }catch(_){
+    // fallback
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand("copy");
+    document.body.removeChild(ta);
+    setLiveStatus("Copied wallet.");
+    setTimeout(() => setLiveStatus(""), 1200);
+  }
 }
 
 function renderWatchPanel(){
@@ -611,8 +646,9 @@ function renderWatchPanel(){
   const posTable = qs("posTable");
   const watchMeta = qs("watchMeta");
 
-  const wallets = Array.from(state.selected);
-  if (!wallets.length){
+  const walletsAll = Array.from(state.selected);
+
+  if (!walletsAll.length){
     empty.classList.remove("hidden");
     cards.innerHTML = "";
     posTable.innerHTML = "";
@@ -622,21 +658,28 @@ function renderWatchPanel(){
 
   empty.classList.add("hidden");
 
-  const last = state.live.lastTs ? new Date(state.live.lastTs).toLocaleTimeString() : "—";
-  watchMeta.textContent = `(selected ${wallets.length}, last update ${last})`;
+  // sort wallets: pinned first, then rest
+  const wallets = [...walletsAll].sort((a,b) => {
+    const ap = state.pinned.has(a) ? 0 : 1;
+    const bp = state.pinned.has(b) ? 0 : 1;
+    if (ap !== bp) return ap - bp;
+    return a.localeCompare(b);
+  });
 
-  // Cards per wallet
+  const last = state.live.lastTs ? new Date(state.live.lastTs).toLocaleTimeString() : "—";
+  watchMeta.textContent = `(selected ${wallets.length}, last ${last}${state.live.loading ? ", updating…" : ""})`;
+
   cards.innerHTML = wallets.map(w => {
     const st = state.live.states.get(w);
     const msx = extractMarginSummary(st);
     const short = w.slice(0,6) + "…" + w.slice(-4);
 
-    const badge = Number.isFinite(msx.withdrawable) && msx.withdrawable > 0
-      ? `<span class="badge ok">withdrawable</span>`
-      : `<span class="badge">watching</span>`;
+    const pinned = state.pinned.has(w);
+    const pinCls = pinned ? "pinned" : "";
 
-    // show a small “raw keys” tooltip for debug
-    const rawKeys = msx.ms ? Object.keys(msx.ms).slice(0,14).join(", ") : "";
+    const badge =
+      Number.isFinite(msx.withdrawable) ? `<span class="badge ok">withdrawable ${esc(fmtUSD(msx.withdrawable))}</span>` :
+      `<span class="badge">watching</span>`;
 
     return `
       <div class="card">
@@ -644,85 +687,100 @@ function renderWatchPanel(){
           <div class="card-title">
             <span class="mono" title="${esc(w)}">${esc(short)}</span>
             ${badge}
-            <span class="muted small" title="${esc(rawKeys)}">${msx.ms ? "marginSummary ✓" : "marginSummary ?"} </span>
           </div>
-          <div class="panel-actions">
-            <button class="btn btn-ghost btn-unwatch" data-wallet="${esc(w)}">Remove</button>
+          <div class="card-actions">
+            <button class="btn-icon ${pinCls}" data-pin="${esc(w)}" title="Pin">${pinned ? "📌" : "📍"}</button>
+            <button class="btn-icon" data-copy="${esc(w)}" title="Copy wallet">⧉</button>
+            <button class="btn btn-ghost" data-unwatch="${esc(w)}">Remove</button>
           </div>
         </div>
         <div class="card-body">
           <div class="kv">
-            <div>
-              <div class="k">Account value</div>
-              <div class="v">${esc(fmtUSD(msx.accountValue))}</div>
-            </div>
-            <div>
-              <div class="k">Notional</div>
-              <div class="v">${esc(fmtUSD(msx.totalNtlPos))}</div>
-            </div>
-            <div>
-              <div class="k">Margin used</div>
-              <div class="v">${esc(fmtUSD(msx.marginUsed))}</div>
-            </div>
-            <div>
-              <div class="k">Withdrawable</div>
-              <div class="v">${esc(fmtUSD(msx.withdrawable))}</div>
-            </div>
+            <div><div class="k">Account value</div><div class="v">${esc(fmtUSD(msx.accountValue))}</div></div>
+            <div><div class="k">Notional</div><div class="v">${esc(fmtUSD(msx.totalNtlPos))}</div></div>
+            <div><div class="k">Margin used</div><div class="v">${esc(fmtUSD(msx.marginUsed))}</div></div>
+            <div><div class="k">Withdrawable</div><div class="v">${esc(fmtUSD(msx.withdrawable))}</div></div>
           </div>
         </div>
       </div>
     `;
   }).join("");
 
-  // remove buttons
-  cards.querySelectorAll(".btn-unwatch").forEach(btn => {
+  // card actions
+  cards.querySelectorAll("[data-unwatch]").forEach(btn => {
     btn.addEventListener("click", () => {
-      const w = btn.getAttribute("data-wallet");
+      const w = btn.getAttribute("data-unwatch");
       if (!w) return;
       state.selected.delete(w);
+      state.pinned.delete(w);
       persistSelected();
+      persistPinned();
       syncSelectedRowStyles();
       onSelectionChanged();
     });
   });
 
-  // Positions combined table
+  cards.querySelectorAll("[data-pin]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const w = btn.getAttribute("data-pin");
+      if (!w) return;
+      if (state.pinned.has(w)) state.pinned.delete(w);
+      else state.pinned.add(w);
+      persistPinned();
+      renderWatchPanel();
+    });
+  });
+
+  cards.querySelectorAll("[data-copy]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const w = btn.getAttribute("data-copy");
+      if (w) copyText(w);
+    });
+  });
+
+  // Positions table
   const mids = state.live.mids || {};
   let posRows = [];
-  for (const w of wallets){
+  for (const w of walletsAll){
     const st = state.live.states.get(w);
     const ps = extractPositions(st, mids).map(p => ({ wallet: w, ...p }));
     posRows.push(...ps);
   }
 
-  // filter positions search
   const q = state.posSearch.trim().toLowerCase();
   if (q){
     posRows = posRows.filter(r => {
-      const w = r.wallet.toLowerCase();
-      if (w.includes(q)) return true;
+      if (r.wallet.toLowerCase().includes(q)) return true;
       if ((r.coin || "").toLowerCase().includes(q)) return true;
       if ((r.side || "").toLowerCase().includes(q)) return true;
       return false;
     });
   }
 
-  // sort positions: default by notional desc
-  posRows.sort((a,b)=> (toNum(b.notional) - toNum(a.notional)));
+  // sort by positions sort state
+  const sk = state.posSort.key;
+  const sd = state.posSort.dir;
+  posRows.sort((a,b)=> comparePos(posValue(a,sk), posValue(b,sk)) * sd);
 
-  // render
   const head = `
     <thead>
       <tr>
-        <th>Wallet</th>
-        <th>Coin</th>
-        <th>Side</th>
-        <th>Size</th>
-        <th>Entry</th>
-        <th>Mark</th>
-        <th>Notional</th>
-        <th>uPnL</th>
-        <th>Lev</th>
+        ${[
+          ["wallet","Wallet"],
+          ["coin","Coin"],
+          ["side","Side"],
+          ["size","Size"],
+          ["entryPx","Entry"],
+          ["markPx","Mark"],
+          ["notional","Notional"],
+          ["upnl","uPnL"],
+          ["roePct","ROE%"],
+          ["liqPx","Liq"],
+          ["lev","Lev"],
+        ].map(([k,lab]) => {
+          const arrow = (state.posSort.key === k) ? (state.posSort.dir === 1 ? " ▲" : " ▼") : "";
+          return `<th data-psort="${esc(k)}">${esc(lab + arrow)}</th>`;
+        }).join("")}
       </tr>
     </thead>
   `;
@@ -731,10 +789,11 @@ function renderWatchPanel(){
     <tbody>
       ${posRows.map(r => {
         const short = r.wallet.slice(0,6) + "…" + r.wallet.slice(-4);
-        const upnl = toNum(r.upnl);
-        const upBadge = Number.isFinite(upnl)
-          ? (upnl >= 0 ? `<span class="badge ok">+${fmtCompact(upnl,2)}</span>` : `<span class="badge bad">${fmtCompact(upnl,2)}</span>`)
+        const up = toNum(r.upnl);
+        const upBadge =
+          Number.isFinite(up) ? (up >= 0 ? `<span class="badge ok">+${esc(fmtCompact(up,2))}</span>` : `<span class="badge bad">${esc(fmtCompact(up,2))}</span>`)
           : `<span class="muted">—</span>`;
+        const roe = toNum(r.roePct);
         return `
           <tr>
             <td class="mono" title="${esc(r.wallet)}">${esc(short)}</td>
@@ -745,7 +804,9 @@ function renderWatchPanel(){
             <td class="mono">${esc(fmtCompact(toNum(r.markPx), 4))}</td>
             <td>${esc(fmtUSD(toNum(r.notional)))}</td>
             <td>${upBadge}</td>
-            <td class="mono">${esc(Number.isFinite(toNum(r.lev)) ? fmtCompact(toNum(r.lev),2) : "—")}</td>
+            <td class="mono">${Number.isFinite(roe) ? esc(roe.toFixed(2)) : "—"}</td>
+            <td class="mono">${esc(fmtCompact(toNum(r.liqPx), 4))}</td>
+            <td class="mono">${esc(fmtCompact(toNum(r.lev), 2))}</td>
           </tr>
         `;
       }).join("")}
@@ -753,13 +814,27 @@ function renderWatchPanel(){
   `;
 
   posTable.innerHTML = head + body;
+
+  // positions header sort click
+  posTable.querySelectorAll("thead th[data-psort]").forEach(th => {
+    th.addEventListener("click", () => {
+      const k = th.getAttribute("data-psort");
+      if (!k) return;
+      if (state.posSort.key === k) state.posSort.dir *= -1;
+      else {
+        state.posSort.key = k;
+        // default direction: numbers descending except wallet/coin asc
+        state.posSort.dir = (k === "wallet" || k === "coin" || k === "side") ? 1 : -1;
+      }
+      renderWatchPanel();
+    });
+  });
 }
 
-// ---------- layout: splitter + collapse ----------
+/* ---------- splitter + focus ---------- */
 function initSplitter(){
   const root = qs("appRoot");
   const splitter = qs("splitter");
-
   let dragging = false;
 
   splitter.addEventListener("mousedown", (e) => {
@@ -771,6 +846,7 @@ function initSplitter(){
 
   window.addEventListener("mousemove", (e) => {
     if (!dragging) return;
+    if (isRankCollapsed()) return; // ignore when collapsed
     const rect = root.getBoundingClientRect();
     const x = e.clientX - rect.left;
     const pct = (x / rect.width) * 100;
@@ -786,56 +862,33 @@ function initSplitter(){
     document.body.style.cursor = "";
   });
 
-  // restore
   const saved = toNum(localStorage.getItem("ws_leftW"));
   if (Number.isFinite(saved)) document.documentElement.style.setProperty("--leftW", `${clamp(saved, 24, 78)}%`);
 }
 
-function togglePanel(panelId){
-  const el = qs(panelId);
-  el.classList.toggle("hidden");
-}
-
-function focusPositions(){
-  const rank = qs("rankPanel");
-  const splitter = qs("splitter");
-  const hidden = rank.classList.toggle("hidden");
-  splitter.classList.toggle("hidden", hidden);
-  // if we hid rankings, set left width small; if show back, restore
-  if (hidden){
-    document.documentElement.style.setProperty("--leftW", "0%");
-  }else{
-    const saved = toNum(localStorage.getItem("ws_leftW"));
-    document.documentElement.style.setProperty("--leftW", `${Number.isFinite(saved) ? clamp(saved,24,78) : 58}%`);
-  }
-}
-
-// ---------- selection change -> start polling ----------
 function stopPolling(){
   if (state.live.timer){
     clearInterval(state.live.timer);
     state.live.timer = null;
   }
 }
+
 function startPolling(){
   stopPolling();
   const sec = state.live.intervalSec;
   if (!sec || sec <= 0) return;
-  state.live.timer = setInterval(async () => {
-    try { await updateLive(); } catch(err){ console.error(err); }
+  state.live.timer = setInterval(() => {
+    // do not overlap
+    if (state.live.loading) return;
+    updateLive().catch(console.error);
   }, sec * 1000);
 }
 
 async function onSelectionChanged(){
-  // refresh live immediately when selection changes
-  try{
-    await updateLive();
-  }catch(err){
-    console.error(err);
-  }
+  await updateLive().catch(console.error);
 }
 
-// ---------- init ----------
+/* ---------- dataset load ---------- */
 async function loadDatasetById(id){
   const ds = state.datasets.find(d => d.id === id) || state.datasets[0];
   if (!ds) throw new Error("No dataset found");
@@ -846,37 +899,32 @@ async function loadDatasetById(id){
 
   const { meta, rows } = normalizeDatasetData(data);
 
-  // flatten rows + add __wallet and __rank
   state.rows = rows.map((r, i) => {
     const flat = flatten(r);
     const wallet = tryAddress(flat);
     flat.__wallet = wallet;
     flat.__rank = r.rank ?? r.__rank ?? (i + 1);
     return flat;
-  }).filter(r => r.__wallet); // keep only rows with wallet
+  }).filter(r => r.__wallet);
 
   state.columns = inferColumns(state.rows);
-
-  // restore visible columns per dataset
   state.visibleCols = loadVisibleColsFromStorage(state.datasetId, state.columns);
 
-  // meta display
   const metaParts = [];
   if (meta?.generatedAt) metaParts.push(`updated ${new Date(meta.generatedAt).toLocaleString()}`);
   if (meta?.count) metaParts.push(`count ${meta.count}`);
   qs("rankMeta").textContent = metaParts.length ? `(${metaParts.join(" • ")})` : "";
 
-  // keep selection persisted
-  syncSelectedRowStyles();
   renderRankTable();
+  renderWatchPanel();
 }
 
+/* ---------- UI bindings ---------- */
 function fillDatasetSelect(){
   const sel = qs("datasetSelect");
   sel.innerHTML = state.datasets.map(d => `<option value="${esc(d.id)}">${esc(d.title)}</option>`).join("");
 
-  // restore last dataset
-  const last = localStorage.getItem("ws_datasetId");
+  const last = localStorage.getItem(LS_DATASET);
   const pick = (last && state.datasets.some(d => d.id === last)) ? last : state.datasets[0]?.id;
   if (pick){
     sel.value = pick;
@@ -885,51 +933,45 @@ function fillDatasetSelect(){
 }
 
 function bindUI(){
+  const debouncedRankRender = debounce(() => renderRankTable(), 120);
+  const debouncedPosRender  = debounce(() => renderWatchPanel(), 120);
+
   qs("rankSearch").addEventListener("input", (e) => {
     state.search = e.target.value || "";
-    renderRankTable();
-  });
-
-  qs("datasetSelect").addEventListener("change", async (e) => {
-    const id = e.target.value;
-    localStorage.setItem("ws_datasetId", id);
-    try{
-      await loadDatasetById(id);
-    }catch(err){
-      console.error(err);
-      alert(`Failed to load dataset: ${id}\n\n${err.message}`);
-    }
-  });
-
-  qs("btnRefresh").addEventListener("click", async () => {
-    try{
-      await loadDatasetById(qs("datasetSelect").value);
-      await updateLive();
-    }catch(err){
-      console.error(err);
-      alert(`Refresh failed.\n\n${err.message}`);
-    }
-  });
-
-  qs("btnRefreshLive").addEventListener("click", async () => {
-    try{ await updateLive(); } catch(err){ console.error(err); alert(err.message); }
-  });
-
-  qs("pollInterval").addEventListener("change", (e) => {
-    state.live.intervalSec = toNum(e.target.value);
-    localStorage.setItem("ws_poll", String(state.live.intervalSec));
-    startPolling();
+    debouncedRankRender();
   });
 
   qs("posSearch").addEventListener("input", (e) => {
     state.posSearch = e.target.value || "";
-    renderWatchPanel();
+    debouncedPosRender();
+  });
+
+  qs("datasetSelect").addEventListener("change", async (e) => {
+    const id = e.target.value;
+    localStorage.setItem(LS_DATASET, id);
+    await loadDatasetById(id);
+    await updateLive().catch(console.error);
+  });
+
+  qs("btnRefresh").addEventListener("click", async () => {
+    await loadDatasetById(qs("datasetSelect").value);
+    await updateLive().catch(console.error);
+  });
+
+  qs("btnRefreshLive").addEventListener("click", () => updateLive().catch(console.error));
+
+  qs("pollInterval").addEventListener("change", (e) => {
+    state.live.intervalSec = toNum(e.target.value);
+    localStorage.setItem(LS_POLL, String(state.live.intervalSec));
+    startPolling();
   });
 
   qs("btnClearSelection").addEventListener("click", () => {
     state.selected.clear();
+    state.pinned.clear();
     persistSelected();
-    syncSelectedRowStyles();
+    persistPinned();
+    renderRankTable();
     onSelectionChanged();
   });
 
@@ -947,20 +989,50 @@ function bindUI(){
   });
   qs("btnColsApply").addEventListener("click", applyColumnsFromModal);
 
-  qs("btnCollapseRank").addEventListener("click", () => togglePanel("rankPanel"));
+  qs("btnCollapseRank").addEventListener("click", () => {
+    setRankCollapsed(!isRankCollapsed());
+  });
+
+  qs("btnFocus").addEventListener("click", () => {
+    setRankCollapsed(true);
+  });
+
   qs("btnCollapseWatch").addEventListener("click", () => qs("watchBody").classList.toggle("hidden"));
-  qs("btnFocus").addEventListener("click", focusPositions);
+
+  // Manual add wallet
+  qs("btnAddWallet").addEventListener("click", async () => {
+    const raw = qs("manualWallet").value;
+    const w = normalizeWallet(raw);
+    if (!w){
+      alert("Invalid wallet. Expected 0x + 40 hex chars.");
+      return;
+    }
+    state.selected.add(w);
+    persistSelected();
+    qs("manualWallet").value = "";
+    renderRankTable(); // checkboxes update if wallet exists in ranking
+    await onSelectionChanged();
+  });
+
+  qs("manualWallet").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") qs("btnAddWallet").click();
+  });
 }
 
+/* ---------- init ---------- */
 async function init(){
   loadSelected();
+  loadPinned();
+
+  // restore collapse state
+  setRankCollapsed(localStorage.getItem("ws_rankCollapsed") === "1");
 
   // restore poll interval
-  const savedPoll = toNum(localStorage.getItem("ws_poll"));
+  const savedPoll = toNum(localStorage.getItem(LS_POLL));
   if (Number.isFinite(savedPoll)){
     state.live.intervalSec = savedPoll;
     qs("pollInterval").value = String(savedPoll);
-  }else{
+  } else {
     state.live.intervalSec = toNum(qs("pollInterval").value);
   }
 
@@ -971,8 +1043,7 @@ async function init(){
   fillDatasetSelect();
   await loadDatasetById(qs("datasetSelect").value);
 
-  // initial live update + polling
-  try{ await updateLive(); }catch(err){ console.error(err); }
+  await updateLive().catch(console.error);
   startPolling();
 }
 

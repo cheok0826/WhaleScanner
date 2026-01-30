@@ -21,11 +21,6 @@
         <select id="datasetSelect"></select>
       </div>
 
-      <div class="control grow">
-        <label class="label">Search</label>
-        <input id="rankSearch" type="search" placeholder="Search wallet / coin / any column..." />
-      </div>
-
       <div class="control">
         <label class="label">Auto refresh</label>
         <select id="pollInterval">
@@ -51,6 +46,12 @@
           Rankings
           <span class="muted" id="rankMeta"></span>
         </div>
+
+        <div class="control grow">
+          <label class="label">Rankings search</label>
+          <input id="rankSearch" type="search" placeholder="Search rankings (wallet / any column)..." />
+        </div>
+
         <div class="panel-actions">
           <button id="btnColumns" class="btn btn-ghost">Columns</button>
           <button id="btnClearSelection" class="btn btn-ghost">Clear selection</button>
@@ -58,9 +59,7 @@
       </div>
 
       <div class="panel-body">
-        <div class="hint">
-          Tip: click a row to toggle selection. Click column headers to sort.
-        </div>
+        <div class="hint">Tip: click a row to toggle selection. Click column headers to sort.</div>
 
         <div class="table-wrap" id="rankTableWrap">
           <table class="table" id="rankTable"></table>
@@ -78,6 +77,7 @@
           Selected wallets
           <span class="muted" id="watchMeta"></span>
         </div>
+
         <div class="panel-actions">
           <button id="btnRefreshLive" class="btn">Update live</button>
           <button id="btnCollapseWatch" class="btn btn-ghost">Toggle Live</button>
@@ -85,6 +85,19 @@
       </div>
 
       <div class="panel-body" id="watchBody">
+        <div class="small muted" id="liveStatus"></div>
+
+        <!-- Manual wallet add (keep this feature) -->
+        <div class="section" style="margin-top:0;">
+          <div class="section-head">
+            <div class="section-title">Add wallet manually</div>
+            <div class="section-actions inline">
+              <input id="manualWallet" type="search" placeholder="0x..." />
+              <button id="btnAddWallet" class="btn">Add</button>
+            </div>
+          </div>
+        </div>
+
         <div class="empty" id="watchEmpty">
           No wallets selected yet. Select wallets from the rankings table (checkbox or row click).
         </div>
