@@ -1,595 +1,1056 @@
-(() => {
-  // ----------------------------
-  // Static snapshot JSON
-  // ----------------------------
-  const SNAPSHOT_URL = "data/latest.json";
+"use strict";
 
-  // ----------------------------
-  // Live polling endpoints
-  // ----------------------------
-  const INFO_URL = "https://api.hyperliquid.xyz/info";
+/**
+ * WhaleScanner Dashboard
+ * - Loads /data/*.json from GitHub repo (via contents API)
+ * - Extracts ranking tables from JSON (rankings.* OR any array-of-objects)
+ * - Renders interactive table: search + sort + pagination
+ * - Watchlist: poll Hyperliquid info endpoint (clearinghouseState) for selected addresses
+ */
 
-  // ----------------------------
-  // Safety throttles
-  // ----------------------------
-  const DEFAULT_TIMEOUT_MS = 20000;
-  const DEFAULT_RETRIES = 2;
-  const BACKOFF_BASE_MS = 650;
-  const MAX_BACKOFF_MS = 6000;
-  const GLOBAL_THROTTLE_MS = 300; // ms between any API calls
-  const LIVE_BATCH_SIZE = 10;     // only for selected wallets
+const state = {
+  owner: null,
+  repo: null,
+  branch: "main",
 
-  // ----------------------------
-  // State
-  // ----------------------------
-  let snapshot = null;                 // last loaded JSON
-  let walletsByAddr = new Map();       // address -> wallet object (snapshot + live fields)
-  let visibleAddrs = [];               // current filtered/sorted addresses
-  let midsCache = null;                // { coin: mid }
-  let midsFetchedAt = 0;
-  let liveTimer = null;
-  let liveInFlight = false;
+  dataFiles: [],          // [{name, download_url, size, sha}, ...]
+  datasetName: null,
+  datasetJson: null,
 
-  // persisted user selections/settings
-  const LS_KEY = "whalescanner.selected";
-  const LS_SETTINGS = "whalescanner.settings";
+  tables: new Map(),      // methodName -> rows[]
+  methodName: null,
 
-  let selected = new Set(loadSelectedFromStorage()); // addresses
-  let settings = loadSettings(); // { rankView, search, liveToggle, pollInterval }
+  sortKey: null,
+  sortDir: "desc",        // asc | desc
+  search: "",
+  pageSize: 50,
+  page: 1,
 
-  // ----------------------------
-  // DOM
-  // ----------------------------
-  const $ = (id) => document.getElementById(id);
+  selectedAddresses: new Set(),   // watched
+  watchRunning: false,
+  watchTimer: null,
+  lastAllMids: null,
+  lastAllMidsAt: 0,
+};
 
-  function setStatus(msg, isError = false) {
-    const el = $("status");
-    if (!el) return;
-    el.textContent = msg;
-    el.style.borderColor = isError ? "#7a1b1b" : "#232a36";
-  }
+const els = {};
+const LS_KEY = "whalescanner_ui_v2";
 
-  function shortAddr(a) {
-    if (!a || a.length < 12) return a || "";
-    return `${a.slice(0, 6)}…${a.slice(-4)}`;
-  }
+document.addEventListener("DOMContentLoaded", () => {
+  bindEls();
+  restoreLocalState();
+  init().catch(err => {
+    console.error(err);
+    setMeta(`Error: ${err.message || err}`);
+  });
+});
 
-  function fmtMoney(x) {
-    const n = Number(x ?? 0);
-    return "$" + n.toLocaleString(undefined, { maximumFractionDigits: 2 });
-  }
+function bindEls() {
+  els.datasetSelect = document.getElementById("datasetSelect");
+  els.reloadBtn = document.getElementById("reloadBtn");
+  els.datasetMeta = document.getElementById("datasetMeta");
 
-  function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+  els.methodTabs = document.getElementById("methodTabs");
+  els.tableWrap = document.getElementById("tableWrap");
+  els.tableFooter = document.getElementById("tableFooter");
 
-  // ----------------------------
-  // LocalStorage
-  // ----------------------------
-  function loadSelectedFromStorage() {
-    try {
-      const raw = localStorage.getItem(LS_KEY);
-      if (!raw) return [];
-      const arr = JSON.parse(raw);
-      return Array.isArray(arr) ? arr : [];
-    } catch {
-      return [];
-    }
-  }
+  els.tableSearch = document.getElementById("tableSearch");
+  els.pageSize = document.getElementById("pageSize");
 
-  function saveSelectedToStorage() {
-    try {
-      localStorage.setItem(LS_KEY, JSON.stringify([...selected]));
-    } catch {}
-  }
+  els.pollInterval = document.getElementById("pollInterval");
+  els.watchToggleBtn = document.getElementById("watchToggleBtn");
+  els.watchStatus = document.getElementById("watchStatus");
+  els.watchlist = document.getElementById("watchlist");
 
-  function loadSettings() {
-    try {
-      const raw = localStorage.getItem(LS_SETTINGS);
-      const s = raw ? JSON.parse(raw) : {};
-      return {
-        rankView: s.rankView || "risk",
-        search: s.search || "",
-        liveToggle: !!s.liveToggle,
-        pollInterval: Number(s.pollInterval || 30),
-      };
-    } catch {
-      return { rankView: "risk", search: "", liveToggle: false, pollInterval: 30 };
-    }
-  }
+  els.manualAddress = document.getElementById("manualAddress");
+  els.addAddressBtn = document.getElementById("addAddressBtn");
 
-  function saveSettings() {
-    try {
-      localStorage.setItem(LS_SETTINGS, JSON.stringify(settings));
-    } catch {}
-  }
+  els.reloadBtn.addEventListener("click", () => init(true));
 
-  // ----------------------------
-  // Fetch helpers (retry + throttle)
-  // ----------------------------
-  let lastReqAt = 0;
+  els.datasetSelect.addEventListener("change", () => {
+    state.datasetName = els.datasetSelect.value;
+    state.methodName = null;
+    state.page = 1;
+    persistLocalState();
+    loadDatasetAndRender().catch(console.error);
+  });
 
-  async function throttle() {
-    const now = Date.now();
-    const wait = Math.max(0, lastReqAt + GLOBAL_THROTTLE_MS - now);
-    if (wait > 0) await sleep(wait);
-    lastReqAt = Date.now();
-  }
-
-  async function backoffSleep(attempt) {
-    const exp = Math.min(MAX_BACKOFF_MS, BACKOFF_BASE_MS * 2 ** attempt);
-    const jitter = Math.floor(Math.random() * 250);
-    await sleep(exp + jitter);
-  }
-
-  async function fetchJsonWithRetry(url, options, retries = DEFAULT_RETRIES, timeoutMs = DEFAULT_TIMEOUT_MS) {
-    let lastErr = null;
-
-    for (let attempt = 0; attempt <= retries; attempt++) {
-      await throttle();
-
-      const ac = new AbortController();
-      const t = setTimeout(() => ac.abort(), timeoutMs);
-
-      try {
-        const resp = await fetch(url, { ...options, signal: ac.signal });
-
-        if ([429, 500, 502, 503, 504].includes(resp.status)) {
-          const txt = await safeReadText(resp);
-          lastErr = new Error(`HTTP ${resp.status} ${resp.statusText}: ${txt.slice(0, 200)}`);
-          if (attempt < retries) {
-            await backoffSleep(attempt);
-            continue;
-          }
-          throw lastErr;
-        }
-
-        if (!resp.ok) {
-          const txt = await safeReadText(resp);
-          throw new Error(`HTTP ${resp.status} ${resp.statusText}: ${txt.slice(0, 300)}`);
-        }
-
-        return await resp.json();
-      } catch (e) {
-        lastErr = e;
-        if (attempt < retries) {
-          await backoffSleep(attempt);
-          continue;
-        }
-        throw e;
-      } finally {
-        clearTimeout(t);
-      }
-    }
-
-    throw lastErr || new Error("Unknown fetch error");
-  }
-
-  async function safeReadText(resp) {
-    try { return await resp.text(); } catch { return ""; }
-  }
-
-  async function postInfo(payload, retries = DEFAULT_RETRIES) {
-    return await fetchJsonWithRetry(
-      INFO_URL,
-      {
-        method: "POST",
-        mode: "cors",
-        credentials: "omit",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      },
-      retries
-    );
-  }
-
-  // ----------------------------
-  // Snapshot loading
-  // ----------------------------
-  async function loadSnapshot() {
-    setStatus("Loading snapshot…");
-
-    const url = `${SNAPSHOT_URL}?t=${Date.now()}`; // cache-bust
-    const data = await fetchJsonWithRetry(url, { method: "GET", cache: "no-store" }, 1);
-
-    snapshot = data;
-    walletsByAddr.clear();
-
-    for (const w of (snapshot.wallets || [])) {
-      const addr = (w.address || "").toLowerCase();
-      if (!addr) continue;
-
-      // attach live fields (will be updated by polling)
-      walletsByAddr.set(addr, {
-        ...w,
-        address: addr,
-        live: {
-          account_value: null,
-          positions: null,
-          last_updated_utc: null,
-        },
-      });
-    }
-
-    // header stats
-    if ($("lastUpdated")) $("lastUpdated").textContent = snapshot.scan_finished_at_utc || snapshot.generated_at_utc || "—";
-    if ($("duration")) $("duration").textContent = snapshot.duration_seconds != null ? `${Number(snapshot.duration_seconds).toFixed(1)}s` : "—";
-    if ($("walletCount")) $("walletCount").textContent = String((snapshot.wallets || []).length);
-    if ($("modeRank")) $("modeRank").textContent = `${snapshot.mode || "—"} / default=${snapshot.rank_by_default || "—"}`;
-
-    setStatus(`✅ Snapshot loaded: ${(snapshot.wallets || []).length} wallets.`);
-    applyViewAndRender();
-  }
-
-  // ----------------------------
-  // View (sort/filter)
-  // ----------------------------
-  function getRankKey() {
-    return ($("rankView")?.value || settings.rankView || "risk");
-  }
-
-  function getSearchTerm() {
-    return ($("searchBox")?.value || settings.search || "").trim().toLowerCase();
-  }
-
-  function applyViewAndRender() {
-    const rankKey = getRankKey();
-    const term = getSearchTerm();
-
-    // build list
-    let addrs = [];
-    for (const [addr] of walletsByAddr.entries()) {
-      if (term && !addr.includes(term)) continue;
-      addrs.push(addr);
-    }
-
-    // sort by precomputed ranks if present, else by score
-    addrs.sort((a, b) => {
-      const wa = walletsByAddr.get(a);
-      const wb = walletsByAddr.get(b);
-
-      const ra = wa?.ranks?.[rankKey] ?? null;
-      const rb = wb?.ranks?.[rankKey] ?? null;
-
-      if (ra != null && rb != null) return ra - rb; // smaller rank = higher
-      const sa = wa?.rank_scores?.[rankKey] ?? 0;
-      const sb = wb?.rank_scores?.[rankKey] ?? 0;
-      return sb - sa;
-    });
-
-    visibleAddrs = addrs;
+  els.tableSearch.addEventListener("input", () => {
+    state.search = els.tableSearch.value.trim();
+    state.page = 1;
+    persistLocalState();
     renderTable();
-    updateSelectedCount();
+  });
+
+  els.pageSize.addEventListener("change", () => {
+    state.pageSize = parseInt(els.pageSize.value, 10);
+    state.page = 1;
+    persistLocalState();
+    renderTable();
+  });
+
+  els.watchToggleBtn.addEventListener("click", () => {
+    state.watchRunning ? stopWatch() : startWatch();
+  });
+
+  els.addAddressBtn.addEventListener("click", () => {
+    const addr = (els.manualAddress.value || "").trim();
+    if (!addr) return;
+    const norm = normalizeAddress(addr);
+    if (!norm) return toast("Invalid address.");
+    state.selectedAddresses.add(norm);
+    els.manualAddress.value = "";
+    persistLocalState();
+    renderTable();     // update checkboxes if address exists in table
+    renderWatchlist(); // show card
+  });
+}
+
+async function init(force = false) {
+  detectRepoFromLocation();
+  setMeta(`Repo: ${state.owner}/${state.repo} · loading datasets…`);
+
+  await loadDataFiles(force);
+
+  // Pick dataset
+  if (!state.datasetName || !state.dataFiles.some(f => f.name === state.datasetName)) {
+    // default: latest-ish by name or first json
+    const preferred = state.dataFiles.find(f => /latest/i.test(f.name)) || state.dataFiles[0];
+    state.datasetName = preferred ? preferred.name : null;
   }
 
-  // ----------------------------
-  // Rendering
-  // ----------------------------
-  function updateSelectedCount() {
-    if ($("selectedCount")) $("selectedCount").textContent = `Selected: ${selected.size}`;
+  populateDatasetSelect();
+
+  if (!state.datasetName) {
+    setMeta("No JSON files found in /data.");
+    els.tableWrap.innerHTML = `<div class="empty">Put your action output JSON files into <code>/data</code> (committed), then reload.</div>`;
+    return;
   }
 
-  function renderTable() {
-    const tbody = document.querySelector("#resultTable tbody");
-    if (!tbody) return;
+  await loadDatasetAndRender();
+}
 
-    tbody.innerHTML = "";
-    const rankKey = getRankKey();
+function detectRepoFromLocation() {
+  // GitHub Pages pattern: https://{owner}.github.io/{repo}/
+  const host = window.location.hostname;
+  const path = window.location.pathname.replace(/^\/+/, "");
+  if (host.endsWith("github.io")) {
+    const owner = host.split(".")[0];
+    const repo = path.split("/")[0] || "";
+    state.owner = owner;
+    state.repo = repo || "WhaleScanner";
+    return;
+  }
 
-    for (const addr of visibleAddrs) {
-      const w = walletsByAddr.get(addr);
-      if (!w) continue;
+  // fallback: hardcode (your repo)
+  state.owner = "cheok0826";
+  state.repo = "WhaleScanner";
+}
 
-      const tr = document.createElement("tr");
+async function loadDataFiles(force = false) {
+  if (state.dataFiles.length && !force) return;
 
-      const checked = selected.has(addr);
-      const snapshotRank = w.ranks?.[rankKey] ?? w.rank ?? "";
-      const score = Number(w.rank_scores?.[rankKey] ?? 0).toFixed(2);
+  const url = `https://api.github.com/repos/${state.owner}/${state.repo}/contents/data?ref=${encodeURIComponent(state.branch)}`;
+  const items = await fetchJson(url, { cache: force ? "no-store" : "default" });
 
-      const liveAv = w.live.account_value;
-      const liveAvStr = liveAv != null ? fmtMoney(liveAv) : "—";
-
-      const details = document.createElement("details");
-      const summary = document.createElement("summary");
-      const livePos = w.live.positions;
-      const posForView = Array.isArray(livePos) ? livePos : (w.positions || []);
-      summary.textContent = `${posForView.length} pos`;
-      details.appendChild(summary);
-
-      const ul = document.createElement("ul");
-      for (const p of posForView) {
-        const li = document.createElement("li");
-        const sizeStr = (p.size ?? 0).toFixed(4);
-        const entry = (p.entry_px ?? 0).toFixed(2);
-        const liq = p.liquidation_px != null ? Number(p.liquidation_px).toFixed(2) : "–";
-        const roe = p.roe_pct != null ? `${Number(p.roe_pct).toFixed(2)}%` : "–";
-        const age = p.age_days != null ? `${Number(p.age_days).toFixed(1)}d` : "–";
-        li.textContent = `${p.coin} ${p.side} ${sizeStr}@${entry} ROE:${roe} Age:${age} LiqPx:${liq}`;
-        ul.appendChild(li);
-      }
-      details.appendChild(ul);
-
-      tr.innerHTML = `
-        <td><input type="checkbox" class="rowSelect" data-addr="${addr}" ${checked ? "checked" : ""}></td>
-        <td>${snapshotRank}</td>
-        <td title="${addr}">${shortAddr(addr)}</td>
-        <td>${fmtMoney(w.account_value)}</td>
-        <td>${liveAvStr}</td>
-        <td>${score}</td>
-        <td>${w.style || ""}</td>
-      `;
-
-      const tdPos = document.createElement("td");
-      tdPos.appendChild(details);
-      tr.appendChild(tdPos);
-
-      tbody.appendChild(tr);
-    }
-
-    // wire row checkboxes
-    tbody.querySelectorAll(".rowSelect").forEach((cb) => {
-      cb.addEventListener("change", (e) => {
-        const a = e.target.getAttribute("data-addr");
-        if (!a) return;
-        if (e.target.checked) selected.add(a);
-        else selected.delete(a);
-        saveSelectedToStorage();
-        updateSelectedCount();
-      });
+  const files = (Array.isArray(items) ? items : [])
+    .filter(x => x && x.type === "file" && typeof x.name === "string" && x.name.toLowerCase().endsWith(".json"))
+    .map(x => ({
+      name: x.name,
+      download_url: x.download_url,
+      size: x.size,
+      sha: x.sha,
+    }))
+    // keep stable order (latest-ish first if name suggests it)
+    .sort((a, b) => {
+      const al = /latest/i.test(a.name) ? 0 : 1;
+      const bl = /latest/i.test(b.name) ? 0 : 1;
+      if (al !== bl) return al - bl;
+      return a.name.localeCompare(b.name);
     });
+
+  state.dataFiles = files;
+}
+
+function populateDatasetSelect() {
+  els.datasetSelect.innerHTML = "";
+  for (const f of state.dataFiles) {
+    const opt = document.createElement("option");
+    opt.value = f.name;
+    opt.textContent = `${f.name} (${formatBytes(f.size)})`;
+    if (f.name === state.datasetName) opt.selected = true;
+    els.datasetSelect.appendChild(opt);
+  }
+}
+
+async function loadDatasetAndRender() {
+  const file = state.dataFiles.find(f => f.name === state.datasetName);
+  if (!file) return;
+
+  setMeta(`Loading ${file.name}…`);
+
+  // Prefer same-origin first (GitHub Pages): ./data/<file>
+  let json = null;
+  try {
+    json = await fetchJson(`./data/${encodeURIComponent(file.name)}`, { cache: "no-store" });
+  } catch (e) {
+    // fallback to raw download_url
+    json = await fetchJson(file.download_url, { cache: "no-store" });
   }
 
-  // ----------------------------
-  // Live polling for selected wallets only
-  // ----------------------------
-  function chunkArray(arr, size) {
-    const out = [];
-    for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
-    return out;
+  state.datasetJson = json;
+  const { tables, meta } = extractTables(json);
+  state.tables = tables;
+
+  const methodNames = [...tables.keys()];
+  if (!methodNames.length) {
+    setMeta(`Loaded ${file.name} · no ranking arrays found`);
+    els.methodTabs.innerHTML = "";
+    els.tableWrap.innerHTML = `<div class="empty">No array-of-objects found in this JSON. If your JSON has <code>rankings</code> arrays, they will appear here.</div>`;
+    els.tableFooter.innerHTML = "";
+    return;
   }
 
-  function toFloat(x, def = 0.0) {
-    const n = parseFloat(x);
-    return Number.isFinite(n) ? n : def;
+  if (!state.methodName || !tables.has(state.methodName)) {
+    state.methodName = methodNames[0];
   }
 
-  async function ensureMidsFresh() {
-    // refresh mids every 5 minutes
-    const now = Date.now();
-    if (midsCache && (now - midsFetchedAt) < 5 * 60 * 1000) return;
+  renderMethodTabs(methodNames);
 
-    try {
-      const data = await postInfo({ type: "allMids", dex: "" }, 1);
-      const mids = {};
-      if (data && typeof data === "object") {
-        for (const [k, v] of Object.entries(data)) {
-          if (typeof k === "string" && !k.startsWith("@")) mids[k] = toFloat(v, 0);
-        }
-      }
-      midsCache = mids;
-      midsFetchedAt = now;
-    } catch {
-      // keep old mids if exists
-    }
-  }
+  // Show meta
+  const metaParts = [];
+  if (meta.generatedAt) metaParts.push(`generated: ${meta.generatedAt}`);
+  metaParts.push(`methods: ${methodNames.length}`);
+  setMeta(`Loaded ${file.name} · ${metaParts.join(" · ")}`);
 
-  function extractAccountValueFromState(state) {
-    const ms = state?.marginSummary || {};
-    return toFloat(ms.accountValue, 0.0);
-  }
+  persistLocalState();
+  renderTable();
+  renderWatchlist();
+}
 
-  function extractPositionsFromState(state, accountValue, mids) {
-    const out = [];
-    const aps = Array.isArray(state?.assetPositions) ? state.assetPositions : [];
-    for (const ap of aps) {
-      const pos = ap?.position || {};
-      const szi = toFloat(pos.szi, 0);
-      if (Math.abs(szi) < 1e-12) continue;
-
-      const coin = String(pos.coin || "Unknown");
-      const entry = toFloat(pos.entryPx, 0);
-      const pv = toFloat(pos.positionValue, 0);
-      const upnl = toFloat(pos.unrealizedPnl, 0);
-
-      const roeRaw = pos.returnOnEquity;
-      const roePct = (roeRaw != null) ? toFloat(roeRaw, 0) * 100.0 : null;
-
-      const levObj = pos.leverage || {};
-      const lev = (levObj && typeof levObj === "object") ? toFloat(levObj.value, 0) : 0;
-
-      const liq = pos.liquidationPx;
-      const liqPx = (liq == null || liq === "") ? null : toFloat(liq, 0);
-
-      const marginUsed = toFloat(pos.marginUsed, 0);
-      const side = szi > 0 ? "LONG" : "SHORT";
-
-      const mid = mids?.[coin];
-      const midPx = (mid && mid > 0) ? mid : null;
-
-      const notionalPctEquity = accountValue > 0 ? (Math.abs(pv) / accountValue) * 100.0 : null;
-      const liqDistPct =
-        (midPx != null && liqPx != null && midPx > 0) ? (Math.abs(midPx - liqPx) / midPx) * 100.0 : null;
-
-      out.push({
-        coin,
-        side,
-        size: szi,
-        entry_px: entry,
-        mid_px: midPx,
-        position_value: pv,
-        unrealized_pnl: upnl,
-        roe_pct: roePct,
-        leverage: lev,
-        liquidation_px: liqPx,
-        margin_used: marginUsed,
-        notional_pct_equity: notionalPctEquity,
-        liq_distance_pct: liqDistPct,
-        age_days: null, // snapshot-only unless you want to compute live
-      });
-    }
-    return out;
-  }
-
-  async function fetchBatchClearinghouseStates(users) {
-    // fail-fast batch: 0 retries; fallback per-user: 2 retries
-    try {
-      const resp = await postInfo({ type: "batchClearinghouseStates", users, dex: "" }, 0);
-      if (Array.isArray(resp) && resp.length === users.length) {
-        const out = new Map();
-        for (let i = 0; i < users.length; i++) {
-          const st = resp[i];
-          if (st && typeof st === "object") out.set(users[i], st);
-        }
-        return out;
-      }
-    } catch {}
-
-    // fallback per-user
-    const out = new Map();
-    for (const u of users) {
-      try {
-        const st = await postInfo({ type: "clearinghouseState", user: u, dex: "" }, 2);
-        if (st && typeof st === "object") out.set(u, st);
-      } catch {}
-    }
-    return out;
-  }
-
-  async function pollSelectedOnce() {
-    if (liveInFlight) return;
-    if (!settings.liveToggle) return;
-    if (selected.size === 0) return;
-
-    liveInFlight = true;
-    try {
-      await ensureMidsFresh();
-
-      const addrs = [...selected].filter((a) => walletsByAddr.has(a));
-      const parts = chunkArray(addrs, LIVE_BATCH_SIZE);
-
-      setStatus(`🔄 Live update: ${addrs.length} selected…`);
-
-      for (let i = 0; i < parts.length; i++) {
-        const part = parts[i];
-        const map = await fetchBatchClearinghouseStates(part);
-
-        for (const addr of part) {
-          const w = walletsByAddr.get(addr);
-          const st = map.get(addr);
-          if (!w || !st) continue;
-
-          const av = extractAccountValueFromState(st);
-          const pos = extractPositionsFromState(st, av, midsCache || {});
-
-          w.live.account_value = av;
-          w.live.positions = pos;
-          w.live.last_updated_utc = new Date().toISOString();
-        }
-      }
-
-      // re-render only (simple approach). If you want “diff rendering”, we can optimize later.
+function renderMethodTabs(methodNames) {
+  els.methodTabs.innerHTML = "";
+  for (const name of methodNames) {
+    const btn = document.createElement("button");
+    btn.className = "tab" + (name === state.methodName ? " tab--active" : "");
+    btn.textContent = name;
+    btn.addEventListener("click", () => {
+      state.methodName = name;
+      state.page = 1;
+      persistLocalState();
+      renderMethodTabs(methodNames);
       renderTable();
-      updateSelectedCount();
-      setStatus(`✅ Live updated ${selected.size} selected wallets.`);
-    } catch (e) {
-      setStatus(`⚠️ Live update error: ${e?.message || e}`, true);
-    } finally {
-      liveInFlight = false;
+    });
+    els.methodTabs.appendChild(btn);
+  }
+}
+
+function renderTable() {
+  const rows = state.tables.get(state.methodName) || [];
+  const prepared = rows.map((r, i) => prepareRow(r, i));
+
+  // Filter by search
+  const q = (state.search || "").toLowerCase();
+  const filtered = q
+    ? prepared.filter(r => rowToSearchText(r).includes(q))
+    : prepared;
+
+  // Determine columns
+  const columns = inferColumns(filtered);
+
+  // Default sort: rank desc? Usually rank asc.
+  if (!state.sortKey) {
+    state.sortKey = columns.find(c => c.key === "rank") ? "rank" : columns.find(c => c.key === "score") ? "score" : columns[0]?.key;
+    state.sortDir = state.sortKey === "rank" ? "asc" : "desc";
+  }
+
+  // Sort
+  const sorted = [...filtered].sort((a, b) => compareForSort(a, b, state.sortKey, state.sortDir));
+
+  // Pagination
+  const pageSize = state.pageSize || 50;
+  const total = sorted.length;
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  state.page = Math.min(state.page, totalPages);
+
+  const start = (state.page - 1) * pageSize;
+  const pageRows = sorted.slice(start, start + pageSize);
+
+  // Render
+  els.tableWrap.innerHTML = "";
+  const table = document.createElement("table");
+  table.className = "dataTable";
+
+  // Header
+  const thead = document.createElement("thead");
+  const hr = document.createElement("tr");
+
+  for (const col of columns) {
+    const th = document.createElement("th");
+    th.title = "Click to sort";
+    th.className = "sortable" + (col.key === state.sortKey ? " sorted" : "");
+
+    th.innerHTML = `<span>${escapeHtml(col.label)}</span>
+      <span class="sortIcon">${col.key === state.sortKey ? (state.sortDir === "asc" ? "▲" : "▼") : ""}</span>`;
+
+    th.addEventListener("click", () => {
+      if (state.sortKey === col.key) {
+        state.sortDir = state.sortDir === "asc" ? "desc" : "asc";
+      } else {
+        state.sortKey = col.key;
+        state.sortDir = col.key === "rank" ? "asc" : "desc";
+      }
+      persistLocalState();
+      renderTable();
+    });
+
+    hr.appendChild(th);
+  }
+
+  thead.appendChild(hr);
+  table.appendChild(thead);
+
+  // Body
+  const tbody = document.createElement("tbody");
+
+  for (const r of pageRows) {
+    const tr = document.createElement("tr");
+
+    for (const col of columns) {
+      const td = document.createElement("td");
+
+      if (col.key === "__watch") {
+        const addr = r.__address;
+        const checked = addr && state.selectedAddresses.has(addr);
+        td.className = "watchCell";
+        td.innerHTML = `
+          <label class="chk">
+            <input type="checkbox" ${checked ? "checked" : ""} ${addr ? "" : "disabled"}>
+            <span></span>
+          </label>
+        `;
+        const input = td.querySelector("input");
+        input?.addEventListener("change", (e) => {
+          if (!addr) return;
+          if (e.target.checked) state.selectedAddresses.add(addr);
+          else state.selectedAddresses.delete(addr);
+          persistLocalState();
+          renderWatchlist();
+        });
+      } else if (col.key === "address") {
+        const addr = r.__address || "";
+        td.innerHTML = addr
+          ? `<a class="addr" href="https://app.hyperliquid.xyz/explorer/address/${addr}" target="_blank" rel="noreferrer">${shortAddr(addr)}</a>`
+          : `<span class="muted">—</span>`;
+      } else {
+        td.innerHTML = formatCell(r[col.key]);
+      }
+
+      tr.appendChild(td);
+    }
+
+    tbody.appendChild(tr);
+  }
+
+  table.appendChild(tbody);
+  els.tableWrap.appendChild(table);
+
+  // Footer / pager
+  els.tableFooter.innerHTML = renderPager(total, totalPages);
+
+  // pager handlers
+  els.tableFooter.querySelectorAll("[data-page]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const p = parseInt(btn.getAttribute("data-page"), 10);
+      if (!Number.isFinite(p)) return;
+      state.page = p;
+      persistLocalState();
+      renderTable();
+    });
+  });
+}
+
+function renderPager(total, totalPages) {
+  const cur = state.page;
+  const from = total ? ((cur - 1) * state.pageSize + 1) : 0;
+  const to = Math.min(total, cur * state.pageSize);
+
+  const mkBtn = (p, label, disabled = false) =>
+    `<button class="btn btn--sm" data-page="${p}" ${disabled ? "disabled" : ""}>${label}</button>`;
+
+  const btns = [];
+  btns.push(mkBtn(1, "⟪", cur === 1));
+  btns.push(mkBtn(Math.max(1, cur - 1), "‹", cur === 1));
+
+  // window pages
+  const windowSize = 3;
+  const start = Math.max(1, cur - windowSize);
+  const end = Math.min(totalPages, cur + windowSize);
+  for (let p = start; p <= end; p++) {
+    btns.push(`<button class="btn btn--sm ${p === cur ? "btn--active" : ""}" data-page="${p}">${p}</button>`);
+  }
+
+  btns.push(mkBtn(Math.min(totalPages, cur + 1), "›", cur === totalPages));
+  btns.push(mkBtn(totalPages, "⟫", cur === totalPages));
+
+  return `
+    <div class="pager">
+      <div class="pager__left">
+        Showing <b>${from}</b>–<b>${to}</b> of <b>${total}</b>
+      </div>
+      <div class="pager__right">
+        ${btns.join("")}
+      </div>
+    </div>
+  `;
+}
+
+/* ---------------------------
+ * Watchlist
+ * --------------------------- */
+
+function startWatch() {
+  if (state.watchRunning) return;
+  state.watchRunning = true;
+  els.watchToggleBtn.textContent = "Stop";
+  els.watchToggleBtn.classList.add("btn--danger");
+
+  tickWatchNow();
+  const sec = Math.max(5, parseInt(els.pollInterval.value, 10) || 20);
+  state.watchTimer = setInterval(tickWatchNow, sec * 1000);
+  persistLocalState();
+}
+
+function stopWatch() {
+  state.watchRunning = false;
+  els.watchToggleBtn.textContent = "Start";
+  els.watchToggleBtn.classList.remove("btn--danger");
+  if (state.watchTimer) clearInterval(state.watchTimer);
+  state.watchTimer = null;
+  els.watchStatus.textContent = "Not running.";
+  persistLocalState();
+}
+
+async function tickWatchNow() {
+  const addrs = [...state.selectedAddresses];
+  if (!addrs.length) {
+    els.watchStatus.textContent = "No watched addresses.";
+    return;
+  }
+
+  els.watchStatus.textContent = `Updating ${addrs.length} address(es)…`;
+
+  // Refresh allMids occasionally (mark prices)
+  try {
+    if (!state.lastAllMids || (Date.now() - state.lastAllMidsAt) > 20_000) {
+      state.lastAllMids = await hlInfo({ type: "allMids" });
+      state.lastAllMidsAt = Date.now();
+    }
+  } catch (e) {
+    // still proceed; we can render without mark
+  }
+
+  // Concurrency limit
+  const limit = 3;
+  const results = new Map();
+
+  for (let i = 0; i < addrs.length; i += limit) {
+    const chunk = addrs.slice(i, i + limit);
+    const chunkRes = await Promise.all(chunk.map(async (a) => {
+      try {
+        const cs = await hlInfo({ type: "clearinghouseState", user: a });
+        return [a, { ok: true, data: cs }];
+      } catch (e) {
+        return [a, { ok: false, error: e.message || String(e) }];
+      }
+    }));
+    for (const [a, r] of chunkRes) results.set(a, r);
+  }
+
+  // Render watch cards
+  renderWatchlist(results);
+
+  const okCount = [...results.values()].filter(x => x.ok).length;
+  els.watchStatus.textContent = `Updated ${okCount}/${addrs.length} · ${new Date().toLocaleTimeString()}`;
+}
+
+function renderWatchlist(liveMap = null) {
+  const addrs = [...state.selectedAddresses];
+
+  if (!addrs.length) {
+    els.watchlist.innerHTML = `<div class="empty">No addresses selected.</div>`;
+    return;
+  }
+
+  // Keep existing cards; update if liveMap present
+  const cards = addrs.map(addr => {
+    const live = liveMap?.get(addr);
+    if (!live) {
+      return `
+        <div class="card">
+          <div class="card__head">
+            <div class="card__title">
+              <a href="https://app.hyperliquid.xyz/explorer/address/${addr}" target="_blank" rel="noreferrer">${shortAddr(addr)}</a>
+            </div>
+            <button class="iconBtn" data-unwatch="${addr}" title="Remove">✕</button>
+          </div>
+          <div class="card__body muted">Waiting for update…</div>
+        </div>
+      `;
+    }
+
+    if (!live.ok) {
+      return `
+        <div class="card">
+          <div class="card__head">
+            <div class="card__title">
+              <a href="https://app.hyperliquid.xyz/explorer/address/${addr}" target="_blank" rel="noreferrer">${shortAddr(addr)}</a>
+            </div>
+            <button class="iconBtn" data-unwatch="${addr}" title="Remove">✕</button>
+          </div>
+          <div class="card__body">
+            <div class="badge badge--bad">Error</div>
+            <div class="muted">${escapeHtml(live.error)}</div>
+          </div>
+        </div>
+      `;
+    }
+
+    return renderWatchCard(addr, live.data);
+  });
+
+  els.watchlist.innerHTML = cards.join("");
+
+  els.watchlist.querySelectorAll("[data-unwatch]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const addr = btn.getAttribute("data-unwatch");
+      if (!addr) return;
+      state.selectedAddresses.delete(addr);
+      persistLocalState();
+      renderTable();
+      renderWatchlist();
+      if (state.watchRunning && state.selectedAddresses.size === 0) stopWatch();
+    });
+  });
+}
+
+function renderWatchCard(addr, cs) {
+  const ms = pickTimeMs(cs?.time);
+  const when = ms ? new Date(ms).toLocaleString() : "—";
+
+  const msu = cs?.marginSummary || {};
+  const withdrawable = cs?.withdrawable;
+
+  const summary = [
+    ["Account", fmtNum(msu.accountValue)],
+    ["Notional", fmtNum(msu.totalNtlPos)],
+    ["Margin Used", fmtNum(msu.totalMarginUsed)],
+    ["Withdrawable", fmtNum(withdrawable)],
+    ["Updated", when],
+  ];
+
+  const positions = Array.isArray(cs?.assetPositions) ? cs.assetPositions : [];
+  const posRows = positions
+    .map(p => p?.position)
+    .filter(Boolean)
+    .filter(p => toNum(p.szi) !== 0);
+
+  const mids = state.lastAllMids || {};
+
+  const posTable = posRows.length
+    ? `
+      <table class="miniTable">
+        <thead>
+          <tr>
+            <th>Coin</th>
+            <th>Side</th>
+            <th class="num">Size</th>
+            <th class="num">Entry</th>
+            <th class="num">Mark</th>
+            <th class="num">uPnL</th>
+            <th class="num">ROE</th>
+            <th class="num">Liq</th>
+            <th class="num">Lev</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${posRows.map(p => {
+            const coin = p.coin || "—";
+            const szi = toNum(p.szi);
+            const side = szi > 0 ? `<span class="badge badge--good">LONG</span>` : `<span class="badge badge--bad">SHORT</span>`;
+            const entry = toNum(p.entryPx);
+            const mark = toNum(mids[coin]); // allMids returns strings keyed by coin
+            const upnl = toNum(p.unrealizedPnl);
+            const roe = toNum(p.returnOnEquity);
+            const liq = toNum(p.liquidationPx);
+            const lev = p?.leverage?.value ?? p?.leverage?.rawUsd ?? "";
+
+            return `
+              <tr>
+                <td>${escapeHtml(coin)}</td>
+                <td>${side}</td>
+                <td class="num">${fmtNum(szi)}</td>
+                <td class="num">${fmtNum(entry)}</td>
+                <td class="num">${mark ? fmtNum(mark) : `<span class="muted">—</span>`}</td>
+                <td class="num">${fmtSigned(upnl)}</td>
+                <td class="num">${roe ? fmtPct(roe) : `<span class="muted">—</span>`}</td>
+                <td class="num">${liq ? fmtNum(liq) : `<span class="muted">—</span>`}</td>
+                <td class="num">${escapeHtml(String(lev || "—"))}</td>
+              </tr>
+            `;
+          }).join("")}
+        </tbody>
+      </table>
+    `
+    : `<div class="muted">No open positions.</div>`;
+
+  return `
+    <div class="card">
+      <div class="card__head">
+        <div class="card__title">
+          <a href="https://app.hyperliquid.xyz/explorer/address/${addr}" target="_blank" rel="noreferrer">${shortAddr(addr)}</a>
+        </div>
+        <button class="iconBtn" data-unwatch="${addr}" title="Remove">✕</button>
+      </div>
+
+      <div class="card__body">
+        <div class="kv">
+          ${summary.map(([k, v]) => `
+            <div class="kv__row">
+              <div class="kv__k">${escapeHtml(k)}</div>
+              <div class="kv__v">${v}</div>
+            </div>
+          `).join("")}
+        </div>
+
+        <div class="divider"></div>
+
+        ${posTable}
+      </div>
+    </div>
+  `;
+}
+
+/* ---------------------------
+ * JSON -> tables extraction
+ * --------------------------- */
+
+function extractTables(json) {
+  const tables = new Map();
+  const meta = {
+    generatedAt: pickGeneratedAt(json),
+  };
+
+  if (Array.isArray(json)) {
+    tables.set("default", json.filter(x => x && typeof x === "object"));
+    return { tables, meta };
+  }
+
+  if (!json || typeof json !== "object") {
+    return { tables, meta };
+  }
+
+  // Common: { rankings: { risk: [...], pnl: [...] } }
+  if (json.rankings && typeof json.rankings === "object") {
+    for (const [k, v] of Object.entries(json.rankings)) {
+      if (Array.isArray(v) && v.length && typeof v[0] === "object") tables.set(k, v);
     }
   }
 
-  function startLiveTimer() {
-    stopLiveTimer();
-    const sec = Math.max(10, Number(settings.pollInterval || 30));
-    liveTimer = setInterval(pollSelectedOnce, sec * 1000);
-  }
+  // If empty, find any arrays-of-objects (depth-limited)
+  if (!tables.size) {
+    const found = [];
+    findArrayTables(json, "", 0, 4, found);
+    // Heuristic: prefer ones that look like ranking rows (have address/user/wallet)
+    const scored = found
+      .map(x => ({ ...x, score: scoreTableRows(x.rows) }))
+      .sort((a, b) => b.score - a.score);
 
-  function stopLiveTimer() {
-    if (liveTimer) clearInterval(liveTimer);
-    liveTimer = null;
-  }
-
-  // ----------------------------
-  // UI wiring
-  // ----------------------------
-  function wireUI() {
-    // controls
-    if ($("rankView")) {
-      $("rankView").value = settings.rankView;
-      $("rankView").addEventListener("change", () => {
-        settings.rankView = $("rankView").value;
-        saveSettings();
-        applyViewAndRender();
-      });
-    }
-
-    if ($("searchBox")) {
-      $("searchBox").value = settings.search;
-      $("searchBox").addEventListener("input", () => {
-        settings.search = $("searchBox").value;
-        saveSettings();
-        applyViewAndRender();
-      });
-    }
-
-    if ($("refreshBtn")) {
-      $("refreshBtn").addEventListener("click", async () => {
-        await loadSnapshot();
-      });
-    }
-
-    if ($("pollInterval")) {
-      $("pollInterval").value = String(settings.pollInterval);
-      $("pollInterval").addEventListener("change", () => {
-        settings.pollInterval = Number($("pollInterval").value || 30);
-        saveSettings();
-        if (settings.liveToggle) startLiveTimer();
-      });
-    }
-
-    if ($("liveToggle")) {
-      $("liveToggle").checked = settings.liveToggle;
-      $("liveToggle").addEventListener("change", () => {
-        settings.liveToggle = $("liveToggle").checked;
-        saveSettings();
-        if (settings.liveToggle) {
-          startLiveTimer();
-          pollSelectedOnce();
-        } else {
-          stopLiveTimer();
-        }
-      });
-    }
-
-    if ($("selectAllVisible")) {
-      $("selectAllVisible").addEventListener("change", (e) => {
-        const on = e.target.checked;
-        for (const addr of visibleAddrs) {
-          if (on) selected.add(addr);
-          else selected.delete(addr);
-        }
-        saveSelectedToStorage();
-        renderTable();
-        updateSelectedCount();
-      });
+    for (const t of scored) {
+      tables.set(t.name, t.rows);
+      if (tables.size >= 12) break; // keep UI sane
     }
   }
 
-  // ----------------------------
-  // Init
-  // ----------------------------
-  async function init() {
-    wireUI();
-    await loadSnapshot();
-    applyViewAndRender();
+  return { tables, meta };
+}
 
-    if (settings.liveToggle) {
-      startLiveTimer();
-      pollSelectedOnce();
+function findArrayTables(obj, path, depth, maxDepth, out) {
+  if (!obj || typeof obj !== "object" || depth > maxDepth) return;
+
+  for (const [k, v] of Object.entries(obj)) {
+    const p = path ? `${path}.${k}` : k;
+
+    if (Array.isArray(v) && v.length && v.every(x => x && typeof x === "object" && !Array.isArray(x))) {
+      out.push({ name: p, rows: v });
+    } else if (v && typeof v === "object" && !Array.isArray(v)) {
+      findArrayTables(v, p, depth + 1, maxDepth, out);
+    }
+  }
+}
+
+function scoreTableRows(rows) {
+  // higher if many rows contain address-like keys
+  let score = 0;
+  const keys = new Set();
+  for (const r of rows.slice(0, 20)) {
+    for (const k of Object.keys(r)) keys.add(k);
+    const a = guessAddressFromRow(r);
+    if (a) score += 3;
+  }
+  // bonus for rank/score presence
+  if (hasKey(keys, ["rank", "score", "risk", "pnl", "accountValue", "account_value"])) score += 2;
+  return score + Math.min(rows.length / 10, 5);
+}
+
+/* ---------------------------
+ * Table helpers
+ * --------------------------- */
+
+function prepareRow(row, i) {
+  const r = { ...row };
+
+  // watch column
+  r.__watch = "";
+
+  // address detection
+  const addr = guessAddressFromRow(r);
+  if (addr) r.__address = addr;
+
+  // Ensure rank exists (fallback to index+1)
+  if (r.rank == null) r.rank = (i + 1);
+
+  return r;
+}
+
+function inferColumns(rows) {
+  // Always start with watch checkbox, rank, address if possible
+  const keys = new Set();
+  for (const r of rows.slice(0, 100)) {
+    for (const k of Object.keys(r)) {
+      if (k.startsWith("__")) continue;
+      keys.add(k);
     }
   }
 
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", init);
+  const keyList = [...keys];
+
+  const addrKey = keyList.find(k => k.toLowerCase() === "address") || null;
+  const hasAddr = rows.some(r => !!r.__address) || !!addrKey;
+
+  // Priority ordering
+  const priority = [
+    "__watch",
+    "rank",
+    hasAddr ? "address" : null,
+    "score",
+    "risk_score",
+    "risk",
+    "pnl_pct",
+    "pnl",
+    "growth_pct",
+    "accountValue",
+    "account_value",
+    "totalValue",
+    "value",
+    "inactive_days",
+    "active_days",
+    "last_trade",
+    "lastTrade",
+  ].filter(Boolean);
+
+  // Remaining keys (excluding internals and any address/user/wallet keys since we map to "address")
+  const addrLike = new Set(["address", "user", "wallet", "wallet_address", "addr"]);
+  const rest = keyList
+    .filter(k => !priority.includes(k) && !addrLike.has(k.toLowerCase()))
+    .sort((a, b) => a.localeCompare(b));
+
+  const finalKeys = [...priority, ...rest].slice(0, 16); // cap columns for readability
+
+  const cols = [];
+  for (const k of finalKeys) {
+    if (k === "address") {
+      cols.push({ key: "address", label: "Address" });
+    } else if (k === "__watch") {
+      cols.push({ key: "__watch", label: "" });
+    } else {
+      cols.push({ key: k, label: prettifyKey(k) });
+    }
+  }
+
+  // If we didn't include "address" but we have __address, inject it after rank
+  if (!cols.some(c => c.key === "address") && hasAddr) {
+    const idx = cols.findIndex(c => c.key === "rank");
+    cols.splice(Math.max(0, idx + 1), 0, { key: "address", label: "Address" });
+  }
+
+  return cols;
+}
+
+function rowToSearchText(r) {
+  const parts = [];
+  if (r.__address) parts.push(r.__address);
+  for (const [k, v] of Object.entries(r)) {
+    if (k.startsWith("__")) continue;
+    if (v == null) continue;
+    parts.push(String(v));
+  }
+  return parts.join(" ").toLowerCase();
+}
+
+function compareForSort(a, b, key, dir) {
+  const av = a[key];
+  const bv = b[key];
+
+  const an = toNum(av);
+  const bn = toNum(bv);
+
+  let cmp = 0;
+
+  // numeric if both parse
+  if (Number.isFinite(an) && Number.isFinite(bn)) {
+    cmp = an - bn;
   } else {
-    init();
+    cmp = String(av ?? "").localeCompare(String(bv ?? ""), undefined, { numeric: true, sensitivity: "base" });
   }
-})();
+
+  return dir === "asc" ? cmp : -cmp;
+}
+
+/* ---------------------------
+ * Hyperliquid API
+ * --------------------------- */
+
+async function hlInfo(body) {
+  // Info endpoint is POST https://api.hyperliquid.xyz/info with type-based schemas :contentReference[oaicite:3]{index=3}
+  const res = await fetchJsonWithTimeout("https://api.hyperliquid.xyz/info", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }, 12_000);
+
+  return res;
+}
+
+/* ---------------------------
+ * Utils
+ * --------------------------- */
+
+async function fetchJson(url, init = {}) {
+  const r = await fetch(url, init);
+  if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
+  return r.json();
+}
+
+async function fetchJsonWithTimeout(url, init = {}, ms = 12000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), ms);
+  try {
+    const r = await fetch(url, { ...init, signal: ctrl.signal });
+    if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
+    return r.json();
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+function setMeta(text) {
+  els.datasetMeta.textContent = text;
+}
+
+function persistLocalState() {
+  const obj = {
+    datasetName: state.datasetName,
+    methodName: state.methodName,
+    search: state.search,
+    pageSize: state.pageSize,
+    selectedAddresses: [...state.selectedAddresses],
+    pollSec: parseInt(els.pollInterval?.value, 10) || 20,
+    watchRunning: state.watchRunning,
+    sortKey: state.sortKey,
+    sortDir: state.sortDir,
+  };
+  try { localStorage.setItem(LS_KEY, JSON.stringify(obj)); } catch {}
+}
+
+function restoreLocalState() {
+  try {
+    const raw = localStorage.getItem(LS_KEY);
+    if (!raw) return;
+    const obj = JSON.parse(raw);
+
+    state.datasetName = obj.datasetName ?? state.datasetName;
+    state.methodName = obj.methodName ?? state.methodName;
+    state.search = obj.search ?? "";
+    state.pageSize = obj.pageSize ?? 50;
+
+    state.sortKey = obj.sortKey ?? null;
+    state.sortDir = obj.sortDir ?? "desc";
+
+    if (Array.isArray(obj.selectedAddresses)) {
+      state.selectedAddresses = new Set(obj.selectedAddresses.map(normalizeAddress).filter(Boolean));
+    }
+    if (obj.pollSec && els.pollInterval) els.pollInterval.value = String(obj.pollSec);
+
+    // set UI inputs if available later
+    setTimeout(() => {
+      if (els.tableSearch) els.tableSearch.value = state.search;
+      if (els.pageSize) els.pageSize.value = String(state.pageSize);
+    }, 0);
+
+    // watch state restored later after init
+    setTimeout(() => {
+      if (obj.watchRunning) startWatch();
+    }, 500);
+  } catch {}
+}
+
+function guessAddressFromRow(r) {
+  const candidates = [
+    r.address, r.user, r.wallet, r.wallet_address, r.addr,
+    r?.account, r?.owner,
+  ].filter(Boolean);
+
+  for (const c of candidates) {
+    const a = normalizeAddress(String(c));
+    if (a) return a;
+  }
+
+  // sometimes row contains "0x..." embedded
+  for (const v of Object.values(r)) {
+    if (typeof v !== "string") continue;
+    const m = v.match(/0x[a-fA-F0-9]{40}/);
+    if (m) return normalizeAddress(m[0]);
+  }
+
+  return null;
+}
+
+function normalizeAddress(s) {
+  const m = String(s).trim().match(/^0x[a-fA-F0-9]{40}$/);
+  return m ? m[0].toLowerCase() : null;
+}
+
+function shortAddr(addr) {
+  return addr.slice(0, 6) + "…" + addr.slice(-4);
+}
+
+function prettifyKey(k) {
+  return k
+    .replace(/^_+/, "")
+    .replace(/__/g, " ")
+    .replace(/_/g, " ")
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .trim()
+    .replace(/\b\w/g, c => c.toUpperCase());
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function formatCell(v) {
+  if (v == null) return `<span class="muted">—</span>`;
+
+  // numbers or numeric strings
+  const n = toNum(v);
+  if (Number.isFinite(n)) {
+    // heuristics: percent-ish keys already handled by caller sometimes; keep generic
+    return fmtNum(n);
+  }
+
+  // booleans
+  if (typeof v === "boolean") return v ? `<span class="badge badge--good">YES</span>` : `<span class="badge">NO</span>`;
+
+  // objects
+  if (typeof v === "object") return `<span class="muted">{…}</span>`;
+
+  // string
+  const s = String(v);
+  if (/^0x[a-fA-F0-9]{40}$/.test(s)) {
+    const a = normalizeAddress(s);
+    return a
+      ? `<a class="addr" href="https://app.hyperliquid.xyz/explorer/address/${a}" target="_blank" rel="noreferrer">${shortAddr(a)}</a>`
+      : escapeHtml(s);
+  }
+  return escapeHtml(s);
+}
+
+function toNum(v) {
+  if (v == null) return NaN;
+  if (typeof v === "number") return v;
+  const s = String(v).trim();
+  if (!s) return NaN;
+  // remove commas
+  const cleaned = s.replace(/,/g, "");
+  const n = Number(cleaned);
+  return Number.isFinite(n) ? n : NaN;
+}
+
+function fmtNum(n) {
+  if (!Number.isFinite(n)) return `<span class="muted">—</span>`;
+  const abs = Math.abs(n);
+  const decimals = abs >= 1000 ? 0 : abs >= 10 ? 2 : 4;
+  return n.toLocaleString(undefined, { maximumFractionDigits: decimals });
+}
+
+function fmtSigned(n) {
+  if (!Number.isFinite(n)) return `<span class="muted">—</span>`;
+  const cls = n >= 0 ? "pos" : "neg";
+  return `<span class="${cls}">${n >= 0 ? "+" : ""}${fmtNum(n)}</span>`;
+}
+
+function fmtPct(n) {
+  if (!Number.isFinite(n)) return `<span class="muted">—</span>`;
+  // returnOnEquity looks like decimal percent or already percent depending on API; display as % with 2 decimals
+  const val = n;
+  return `${val.toFixed(2)}%`;
+}
+
+function pickTimeMs(t) {
+  const n = toNum(t);
+  if (!Number.isFinite(n)) return null;
+  // if it's seconds, convert
+  return n > 1e12 ? n : n * 1000;
+}
+
+function pickGeneratedAt(json) {
+  if (!json || typeof json !== "object") return null;
+  const candidates = [
+    json.generated_at, json.generatedAt, json.created_at, json.createdAt,
+    json.time, json.timestamp,
+  ].filter(Boolean);
+
+  for (const c of candidates) {
+    const ms = pickTimeMs(c);
+    if (ms) return new Date(ms).toLocaleString();
+    // if already ISO string
+    if (typeof c === "string" && c.includes("T")) return c;
+  }
+  return null;
+}
+
+function hasKey(set, keys) {
+  for (const k of keys) if (set.has(k)) return true;
+  return false;
+}
+
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes < 0) return "—";
+  const units = ["B", "KB", "MB", "GB"];
+  let v = bytes;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return `${v.toFixed(i === 0 ? 0 : 1)}${units[i]}`;
+}
+
+function toast(msg) {
+  // lightweight: reuse datasetMeta area for now
+  setMeta(msg);
+  setTimeout(() => setMeta(""), 2500);
+}

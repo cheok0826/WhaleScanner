@@ -1,93 +1,98 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta http-equiv="Content-Security-Policy" content="
-  default-src 'self';
-  script-src 'self';
-  style-src 'self' 'unsafe-inline';
-  connect-src https://api.hyperliquid.xyz https://stats-data.hyperliquid.xyz;
-  img-src 'self' data:;
-  object-src 'none';
-  base-uri 'self';
-">
-
-  <title>Hyperliquid Whale Scanner</title>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>WhaleScanner Dashboard</title>
   <link rel="stylesheet" href="style.css" />
-  <!--
-    This static website implements a client‑side version of the Hyperliquid
-    whale scanner.  It uses the Hyperliquid public APIs to fetch account
-    and position data, computes risk and performance metrics, and displays
-    the results in a sortable table.  All requests are performed in
-    JavaScript using the Fetch API; no server component is required.
-
-    To host this site on GitHub Pages simply push these files to the
-    ``gh-pages`` branch of a repository.  Ensure that you enable GitHub
-    Pages for that branch in the repository settings.
-  -->
 </head>
+
 <body>
-  <header>
-    <h1>Hyperliquid Whale Scanner</h1>
-    <p>
-      Scan Hyperliquid wallets, rank them by risk, PnL, stability or
-      conviction, and explore their open positions directly in your
-      browser.  No backend or API keys required.
-    </p>
+  <header class="topbar">
+    <div class="topbar__left">
+      <div class="brand">
+        <div class="brand__title">WhaleScanner</div>
+        <div class="brand__sub">Rankings + Live Watchlist</div>
+      </div>
+    </div>
+
+    <div class="topbar__right">
+      <div class="control">
+        <label for="datasetSelect">Dataset</label>
+        <select id="datasetSelect"></select>
+      </div>
+
+      <button id="reloadBtn" class="btn">Reload</button>
+
+      <div class="meta" id="datasetMeta">—</div>
+    </div>
   </header>
 
-  <main>
-    <div class="controls">
-  <select id="rankView">
-    <option value="risk">risk</option>
-    <option value="pnl">pnl</option>
-    <option value="stability">stability</option>
-    <option value="conviction">conviction</option>
-  </select>
+  <main class="layout">
+    <section class="panel panel--main">
+      <div class="panel__header">
+        <div class="tabs" id="methodTabs"></div>
 
-  <input id="searchBox" placeholder="Search address…" />
+        <div class="panel__tools">
+          <div class="control">
+            <label for="tableSearch">Search</label>
+            <input id="tableSearch" type="text" placeholder="address / coin / anything…" />
+          </div>
 
-  <button id="refreshBtn">Reload snapshot</button>
+          <div class="control">
+            <label for="pageSize">Rows</label>
+            <select id="pageSize">
+              <option value="25">25</option>
+              <option value="50" selected>50</option>
+              <option value="100">100</option>
+              <option value="250">250</option>
+              <option value="999999">All</option>
+            </select>
+          </div>
+        </div>
+      </div>
 
-  <label>
-    <input type="checkbox" id="liveToggle" />
-    Live monitor selected
-  </label>
+      <div class="panel__body">
+        <div id="tableWrap" class="tableWrap"></div>
+        <div id="tableFooter" class="tableFooter"></div>
+      </div>
+    </section>
 
-  <label>
-    Interval (sec):
-    <input id="pollInterval" type="number" min="10" step="5" value="30" />
-  </label>
+    <aside class="panel panel--watch">
+      <div class="panel__header">
+        <div>
+          <div class="panel__title">Watchlist</div>
+          <div class="panel__hint">Tick addresses in the table to watch them live.</div>
+        </div>
 
-  <span id="selectedCount">Selected: 0</span>
-</div>
+        <div class="watch__controls">
+          <div class="control">
+            <label for="pollInterval">Poll (sec)</label>
+            <input id="pollInterval" type="number" min="5" step="1" value="20" />
+          </div>
+          <button id="watchToggleBtn" class="btn btn--primary">Start</button>
+        </div>
+      </div>
 
-<table id="resultTable">
-  <thead>
-    <tr>
-      <th><input type="checkbox" id="selectAllVisible" /></th>
-      <th>Rank</th>
-      <th>Address</th>
-      <th>Snapshot Account</th>
-      <th>Live Account</th>
-      <th>Score</th>
-      <th>Style</th>
-      <th>Positions</th>
-    </tr>
-  </thead>
-  <tbody></tbody>
-</table>
+      <div class="panel__body">
+        <div class="watch__adder">
+          <input id="manualAddress" type="text" placeholder="Add address manually (0x...)" />
+          <button id="addAddressBtn" class="btn">Add</button>
+        </div>
 
+        <div id="watchStatus" class="watchStatus">Not running.</div>
+
+        <div id="watchlist" class="watchlist"></div>
+      </div>
+    </aside>
   </main>
 
-  <footer>
-    <p>
-      Built with ❤️ for the Hyperliquid community.  Data sourced from
-      public endpoints at <a href="https://hyperliquid.xyz" target="_blank">Hyperliquid</a>.
-    </p>
+  <footer class="footer">
+    <div>
+      Live data uses Hyperliquid <code>/info</code> (<code>clearinghouseState</code>). :contentReference[oaicite:2]{index=2}
+    </div>
   </footer>
 
-  <script src="https://cheok0826.github.io/WhaleScanner/script.js"></script>
+  <script type="module" src="script.js"></script>
 </body>
 </html>
