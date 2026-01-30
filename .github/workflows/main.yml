@@ -33,7 +33,7 @@ jobs:
 
       - name: Run whale scanner (write JSON snapshots)
         run: |
-          python -u scanner/whale_scanner.py \
+          python -u whale_scanner.py \
             --auto-find \
             --top-n 200 \
             --min-value 500000 \
