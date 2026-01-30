@@ -641,13 +641,24 @@ function setLiveStatus(text){
 function sleep(ms){
   return new Promise(resolve => setTimeout(resolve, ms));
 }
-async function updateLive({ force = false } = {}){
-  const wallets = Array.from(state.selected).filter(Boolean);
 
-  // If user changed selection, kill the old inflight request
-  if (force && state.live.abortController){
-    try { state.live.abortController.abort(); } catch(_) {}
-  }
+async function mapLimit(items, limit, fn){
+  const out = new Array(items.length);
+  let i = 0;
+
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (true){
+      const idx = i++;
+      if (idx >= items.length) break;
+      out[idx] = await fn(items[idx], idx);
+    }
+  });
+
+  await Promise.all(workers);
+  return out;
+}
+async function updateLive(){
+  const wallets = Array.from(state.selected).filter(Boolean);
 
   if (!wallets.length){
     state.live.states.clear();
@@ -657,107 +668,68 @@ async function updateLive({ force = false } = {}){
     return;
   }
 
-  // If something is already running, reuse it unless force=true
-  if (state.live.inflight && !force) return state.live.inflight;
+  // Share inflight promise (prevents overlap from poll + manual refresh)
+  if (state.live.inflight) return state.live.inflight;
 
-  const controller = new AbortController();
-  state.live.abortController = controller;
-
-  const myPromise = (state.live.inflight = (async () => {
+  state.live.inflight = (async () => {
     state.live.loading = true;
     setLiveStatus("Updating live data…");
 
     let liveWarning = null;
 
-    // Helper: old calls must not overwrite UI after a new call starts
-    const stillCurrent = () => state.live.abortController === controller;
-
     try{
       // 1) mids (non-fatal)
       try{
-        state.live.mids = await hlPost({ type: "allMids", dex: "" }, { signal: controller.signal });
+        state.live.mids = await hlPost({ type: "allMids", dex: "" });
       }catch(err){
-        if (err?.name === "AbortError") return; // stop quietly
         liveWarning = `failed to load mids (${err?.message || err})`;
         state.live.mids = null;
       }
 
-      // 2) states (batch with split-on-fail)
+      // 2) states (NO batch; per-wallet)
       const results = new Map();
-      const MAX_BATCH = 60;
-      const queue = [];
-      for (let i = 0; i < wallets.length; i += MAX_BATCH){
-        queue.push(wallets.slice(i, i + MAX_BATCH));
+
+      const CONCURRENCY = 4;     // keep low to avoid 429 / server strain
+      const GROUP_SIZE  = 20;    // small groups to reduce burst
+      const PER_CALL_GAP_MS = 60;
+      const GROUP_GAP_MS    = 150;
+
+      for (let start = 0; start < wallets.length; start += GROUP_SIZE){
+        const group = wallets.slice(start, start + GROUP_SIZE);
+
+        await mapLimit(group, CONCURRENCY, async (w) => {
+          try{
+            const st = await hlPost({ type: "clearinghouseState", user: w, dex: "" });
+            results.set(w, st ?? null);
+          }catch(err){
+            results.set(w, null);
+            liveWarning = err?.message || String(err);
+          }
+
+          // tiny spacing helps with stability in browser
+          await sleep(PER_CALL_GAP_MS);
+        });
+
+        await sleep(GROUP_GAP_MS);
       }
 
-      while (queue.length){
-        if (controller.signal.aborted) return;
-
-        const chunk = queue.shift();
-
-        try{
-          const resp = await hlPost(
-            { type: "batchClearinghouseStates", users: chunk, dex: "" },
-            { signal: controller.signal }
-          );
-
-          if (!Array.isArray(resp)){
-            throw new Error(`batchClearinghouseStates returned ${resp === null ? "null" : typeof resp}`);
-          }
-
-          for (let j = 0; j < chunk.length; j++){
-            results.set(chunk[j], resp[j] ?? null);
-          }
-        }catch(err){
-          if (err?.name === "AbortError") return;
-
-          // split until size=1, then fallback to single
-          if (chunk.length > 1){
-            const mid = Math.ceil(chunk.length / 2);
-            queue.unshift(chunk.slice(mid), chunk.slice(0, mid));
-          } else {
-            const w = chunk[0];
-            try{
-              const single = await hlPost(
-                { type: "clearinghouseState", user: w, dex: "" },
-                { signal: controller.signal }
-              );
-              results.set(w, single ?? null);
-            }catch(singleErr){
-              if (singleErr?.name === "AbortError") return;
-              results.set(w, null);
-              liveWarning = singleErr?.message || String(singleErr);
-            }
-          }
-        }
-
-        await sleep(80);
-      }
-
-      // If a newer call started, don't overwrite anything
-      if (!stillCurrent()) return;
-
-      state.live.states = results;
+      state.live.states = results;   // replaces map, so removed wallets don’t linger
       state.live.lastTs = Date.now();
     } finally {
-      // Same: don’t let an older call “finish” and overwrite status/UI
-      if (state.live.abortController !== controller) return;
-
       state.live.loading = false;
       const t = state.live.lastTs ? new Date(state.live.lastTs).toLocaleTimeString() : "—";
       setLiveStatus(`Live updated: ${t}${liveWarning ? ` (warning: ${liveWarning})` : ""}`);
       renderWatchPanel();
     }
-  })());
+  })();
 
   try{
-    return await myPromise;
+    return await state.live.inflight;
   } finally {
-    // Only clear if this promise is still the current one
-    if (state.live.inflight === myPromise) state.live.inflight = null;
-    if (state.live.abortController === controller) state.live.abortController = null;
+    state.live.inflight = null;
   }
 }
+
 
 function removeWalletEverywhere(w){
   const nw = normalizeWallet(w) || w;
@@ -769,7 +741,6 @@ function removeWalletEverywhere(w){
   syncSelectedRowStyles();
   renderWatchPanel();
 }
-
 function extractMarginSummary(st){
   const ms =
     st?.marginSummary ||
@@ -788,21 +759,10 @@ function extractMarginSummary(st){
   const withdrawableMs  = pickNum(ms, ["withdrawable", "availableToWithdraw", "maxWithdrawable", "withdrawableUsd"]);
   const withdrawable = Number.isFinite(withdrawableTop) ? withdrawableTop : withdrawableMs;
 
-  // % of equity (can be >100)
+  // % of equity
   const marginUsedPctEquity =
     (Number.isFinite(accountValue) && accountValue > 0 && Number.isFinite(marginUsed))
       ? (marginUsed / accountValue) * 100
-      : NaN;
-
-  // % of position value (gives implied leverage)
-  const marginUsedPctPos =
-    (Number.isFinite(totalNtlPos) && totalNtlPos > 0 && Number.isFinite(marginUsed))
-      ? (marginUsed / totalNtlPos) * 100
-      : NaN;
-
-  const effectiveLev =
-    (Number.isFinite(totalNtlPos) && totalNtlPos > 0 && Number.isFinite(marginUsed) && marginUsed > 0)
-      ? (totalNtlPos / marginUsed)
       : NaN;
 
   const maintenancePctEquity =
@@ -810,9 +770,20 @@ function extractMarginSummary(st){
       ? (maintenanceUsed / accountValue) * 100
       : NaN;
 
+  // % of position value
+  const marginUsedPctPos =
+    (Number.isFinite(totalNtlPos) && totalNtlPos > 0 && Number.isFinite(marginUsed))
+      ? (marginUsed / totalNtlPos) * 100
+      : NaN;
+
   const maintenancePctPos =
     (Number.isFinite(totalNtlPos) && totalNtlPos > 0 && Number.isFinite(maintenanceUsed))
       ? (maintenanceUsed / totalNtlPos) * 100
+      : NaN;
+
+  const effectiveLev =
+    (Number.isFinite(totalNtlPos) && totalNtlPos > 0 && Number.isFinite(marginUsed) && marginUsed > 0)
+      ? (totalNtlPos / marginUsed)
       : NaN;
 
   const exposureX =
@@ -833,14 +804,17 @@ function extractMarginSummary(st){
     maintenanceUsed,
     withdrawable,
 
+    // keep your old UI field names working:
+    marginUsedPct: marginUsedPctEquity,
+    maintenancePct: maintenancePctEquity,
+
+    // extra useful fields:
     marginUsedPctEquity,
-    marginUsedPctPos,
-    effectiveLev,
-
     maintenancePctEquity,
+    marginUsedPctPos,
     maintenancePctPos,
+    effectiveLev,
     exposureX,
-
     marginBuffer,
   };
 }
