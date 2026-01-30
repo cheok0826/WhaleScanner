@@ -2,7 +2,7 @@ name: Whale Scan (Hyperliquid)
 
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "*/15 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -45,10 +45,39 @@ jobs:
             --timeout 12 \
             --retries 2
 
+      # ✅ NEW: generate data/manifest.json for the dashboard to auto-list datasets
+      - name: Build data/manifest.json
+        run: |
+          python - << 'PY'
+          import json, os, glob, datetime
+
+          files = sorted([
+              os.path.basename(p)
+              for p in glob.glob("data/*.json")
+              if not p.endswith("manifest.json")
+          ])
+
+          datasets = []
+          for f in files:
+              base = f[:-5] if f.lower().endswith(".json") else f
+              datasets.append({"id": base, "title": base, "file": f"data/{f}"})
+
+          manifest = {
+              "generatedAt": datetime.datetime.utcnow().isoformat() + "Z",
+              "datasets": datasets
+          }
+
+          os.makedirs("data", exist_ok=True)
+          with open("data/manifest.json", "w", encoding="utf-8") as fp:
+              json.dump(manifest, fp, ensure_ascii=False, indent=2)
+
+          print("manifest datasets:", len(datasets))
+          PY
+
       - name: Commit & push data/*.json
         run: |
           git status --porcelain
-          git add data/*.json
+          git add data/*.json data/manifest.json
           if git diff --cached --quiet; then
             echo "No changes to commit"
             exit 0
