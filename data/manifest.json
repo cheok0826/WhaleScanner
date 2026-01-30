@@ -1,0 +1,35 @@
+{
+  "generatedAt": "2026-01-30T11:52:43.255725Z",
+  "datasets": [
+    {
+      "id": "active_all",
+      "title": "active_all",
+      "file": "data/active_all.json"
+    },
+    {
+      "id": "active_conviction",
+      "title": "active_conviction",
+      "file": "data/active_conviction.json"
+    },
+    {
+      "id": "active_pnl",
+      "title": "active_pnl",
+      "file": "data/active_pnl.json"
+    },
+    {
+      "id": "active_risk",
+      "title": "active_risk",
+      "file": "data/active_risk.json"
+    },
+    {
+      "id": "active_stability",
+      "title": "active_stability",
+      "file": "data/active_stability.json"
+    },
+    {
+      "id": "meta",
+      "title": "meta",
+      "file": "data/meta.json"
+    }
+  ]
+}
