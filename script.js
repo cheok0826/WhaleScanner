@@ -154,7 +154,8 @@ async function fetchJson(url){
   if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
   return await r.json();
 }
-async function hlPost(payload){
+async function hlPost(payload, opts = {}){
+  const { signal } = opts;
   const maxRetries = 3;
   let lastErr = null;
 
@@ -165,11 +166,11 @@ async function hlPost(payload){
         cache: "no-store",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(payload),
+        signal,
       });
 
       const text = await r.text(); // read once
       if (r.ok){
-        // some HL responses are JSON; parse safely
         try { return JSON.parse(text); }
         catch { return text; }
       }
@@ -182,6 +183,9 @@ async function hlPost(payload){
       const delay = 400 * Math.pow(2, attempt) + Math.random() * 200;
       await new Promise(resolve => setTimeout(resolve, delay));
     }catch(err){
+      // If we aborted, just bubble up immediately (don't retry)
+      if (err?.name === "AbortError") throw err;
+
       lastErr = err;
       if (attempt === maxRetries) throw err;
 
@@ -192,6 +196,7 @@ async function hlPost(payload){
 
   throw lastErr || new Error("HL request failed");
 }
+
 
 
 /* ---------- layout collapse ---------- */
@@ -231,6 +236,7 @@ const state = {
     intervalSec: 20,
     loading: false,
     inflight: null,
+    abortController: null,
   },
 };
 
@@ -635,8 +641,13 @@ function setLiveStatus(text){
 function sleep(ms){
   return new Promise(resolve => setTimeout(resolve, ms));
 }
-async function updateLive(){
+async function updateLive({ force = false } = {}){
   const wallets = Array.from(state.selected).filter(Boolean);
+
+  // If user changed selection, kill the old inflight request
+  if (force && state.live.abortController){
+    try { state.live.abortController.abort(); } catch(_) {}
+  }
 
   if (!wallets.length){
     state.live.states.clear();
@@ -646,28 +657,33 @@ async function updateLive(){
     return;
   }
 
-  // Share inflight promise (prevents overlap from poll + manual refresh)
-  if (state.live.inflight) return state.live.inflight;
+  // If something is already running, reuse it unless force=true
+  if (state.live.inflight && !force) return state.live.inflight;
 
-  state.live.inflight = (async () => {
+  const controller = new AbortController();
+  state.live.abortController = controller;
+
+  const myPromise = (state.live.inflight = (async () => {
     state.live.loading = true;
     setLiveStatus("Updating live data…");
 
     let liveWarning = null;
 
+    // Helper: old calls must not overwrite UI after a new call starts
+    const stillCurrent = () => state.live.abortController === controller;
+
     try{
       // 1) mids (non-fatal)
       try{
-        state.live.mids = await hlPost({ type: "allMids", dex: "" });
+        state.live.mids = await hlPost({ type: "allMids", dex: "" }, { signal: controller.signal });
       }catch(err){
+        if (err?.name === "AbortError") return; // stop quietly
         liveWarning = `failed to load mids (${err?.message || err})`;
         state.live.mids = null;
       }
 
       // 2) states (batch with split-on-fail)
       const results = new Map();
-
-      // start with max batches, then split only when needed
       const MAX_BATCH = 60;
       const queue = [];
       for (let i = 0; i < wallets.length; i += MAX_BATCH){
@@ -675,10 +691,15 @@ async function updateLive(){
       }
 
       while (queue.length){
+        if (controller.signal.aborted) return;
+
         const chunk = queue.shift();
 
         try{
-          const resp = await hlPost({ type: "batchClearinghouseStates", users: chunk, dex: "" });
+          const resp = await hlPost(
+            { type: "batchClearinghouseStates", users: chunk, dex: "" },
+            { signal: controller.signal }
+          );
 
           if (!Array.isArray(resp)){
             throw new Error(`batchClearinghouseStates returned ${resp === null ? "null" : typeof resp}`);
@@ -688,16 +709,22 @@ async function updateLive(){
             results.set(chunk[j], resp[j] ?? null);
           }
         }catch(err){
-          // If batch fails: split chunk until size=1, then fallback to single-call
+          if (err?.name === "AbortError") return;
+
+          // split until size=1, then fallback to single
           if (chunk.length > 1){
             const mid = Math.ceil(chunk.length / 2);
-            queue.unshift(chunk.slice(mid), chunk.slice(0, mid)); // push halves to front
+            queue.unshift(chunk.slice(mid), chunk.slice(0, mid));
           } else {
             const w = chunk[0];
             try{
-              const single = await hlPost({ type: "clearinghouseState", user: w, dex: "" });
+              const single = await hlPost(
+                { type: "clearinghouseState", user: w, dex: "" },
+                { signal: controller.signal }
+              );
               results.set(w, single ?? null);
             }catch(singleErr){
+              if (singleErr?.name === "AbortError") return;
               results.set(w, null);
               liveWarning = singleErr?.message || String(singleErr);
             }
@@ -707,22 +734,42 @@ async function updateLive(){
         await sleep(80);
       }
 
+      // If a newer call started, don't overwrite anything
+      if (!stillCurrent()) return;
+
       state.live.states = results;
       state.live.lastTs = Date.now();
     } finally {
+      // Same: don’t let an older call “finish” and overwrite status/UI
+      if (state.live.abortController !== controller) return;
+
       state.live.loading = false;
       const t = state.live.lastTs ? new Date(state.live.lastTs).toLocaleTimeString() : "—";
       setLiveStatus(`Live updated: ${t}${liveWarning ? ` (warning: ${liveWarning})` : ""}`);
       renderWatchPanel();
     }
-  })();
+  })());
 
   try{
-    return await state.live.inflight;
+    return await myPromise;
   } finally {
-    state.live.inflight = null;
+    // Only clear if this promise is still the current one
+    if (state.live.inflight === myPromise) state.live.inflight = null;
+    if (state.live.abortController === controller) state.live.abortController = null;
   }
 }
+
+function removeWalletEverywhere(w){
+  const nw = normalizeWallet(w) || w;
+  state.selected.delete(nw);
+  state.pinned.delete(nw);
+  state.live.states.delete(nw); // remove cached state immediately
+  persistSelected();
+  persistPinned();
+  syncSelectedRowStyles();
+  renderWatchPanel();
+}
+
 function extractMarginSummary(st){
   const ms =
     st?.marginSummary ||
@@ -950,7 +997,7 @@ function renderWatchPanel(){
     const pinned = state.pinned.has(w);
     const pinCls = pinned ? "pinned" : "";
 
-    const muPct = msx.marginUsedPct;
+    const muPct = msx.marginUsedPctEquity;
     const badge =
       Number.isFinite(muPct)
         ? `<span class="badge ${muPct >= 90 ? "bad" : "ok"}">margin ${esc(fmtPct(muPct))}</span>`
@@ -987,7 +1034,7 @@ function renderWatchPanel(){
             <div>
               <div class="k">Margin used</div>
               <div class="v mono">
-                ${esc(fmtPct(msx.marginUsedPct))} (${esc(fmtUSD(msx.marginUsed))})
+                ${esc(fmtPct(msx.marginUsedPctEquity))} eq • ${esc(fmtPct(msx.marginUsedPctPos))} pos • ${esc(fmtX(msx.effectiveLev))} (${esc(fmtUSD(msx.marginUsed))})
               </div>
             </div>
 
@@ -1017,14 +1064,11 @@ function renderWatchPanel(){
     btn.addEventListener("click", () => {
       const w = btn.getAttribute("data-unwatch");
       if (!w) return;
-      state.selected.delete(w);
-      state.pinned.delete(w);
-      persistSelected();
-      persistPinned();
-      syncSelectedRowStyles();
-      onSelectionChanged();
+      removeWalletEverywhere(w);
+      updateLive({ force: true }).catch(console.error); // abort old request, send new users list
     });
   });
+
 
   cards.querySelectorAll("[data-pin]").forEach(btn => {
     btn.addEventListener("click", () => {
@@ -1200,7 +1244,7 @@ function startPolling(){
 }
 
 async function onSelectionChanged(){
-  await updateLive().catch(console.error);
+  await updateLive({ force: true }).catch(console.error);
 }
 
 /* ---------- dataset load ---------- */
