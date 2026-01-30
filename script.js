@@ -79,8 +79,14 @@ function flatten(obj, prefix="", out={}){
 
 function normalizeWallet(s){
   const t = String(s || "").trim();
-  if (!/^0x[a-fA-F0-9]{40}$/.test(t)) return null;
-  return t.toLowerCase();
+
+  // accept 0x + 40 hex
+  if (/^0x[a-fA-F0-9]{40}$/.test(t)) return t.toLowerCase();
+
+  // accept 40 hex without 0x
+  if (/^[a-fA-F0-9]{40}$/.test(t)) return ("0x" + t).toLowerCase();
+
+  return null;
 }
 
 function tryAddress(rowFlat){
@@ -204,20 +210,57 @@ async function loadManifest(){
 
 /* ---------- dataset parsing ---------- */
 function normalizeDatasetData(data){
-  if (Array.isArray(data)) return { meta: {}, rows: data };
-  if (data && typeof data === "object"){
-    const rows =
-      (Array.isArray(data.rows) && data.rows) ||
-      (Array.isArray(data.data) && data.data) ||
-      (Array.isArray(data.items) && data.items) ||
-      (Array.isArray(data.rankings) && data.rankings) ||
-      [];
-    const meta = { ...data };
-    delete meta.rows; delete meta.data; delete meta.items; delete meta.rankings;
-    return { meta, rows };
+  // Goal: return { meta, rows } where rows is an array of objects
+
+  // 1) already an array
+  if (Array.isArray(data)) {
+    return { meta: {}, rows: data };
   }
+
+  // 2) object with known array keys
+  if (data && typeof data === "object") {
+    const knownKeys = ["rows", "data", "items", "rankings", "results", "wallets", "whales", "list"];
+    for (const k of knownKeys) {
+      if (Array.isArray(data[k])) {
+        const meta = { ...data };
+        delete meta[k];
+        return { meta, rows: data[k] };
+      }
+    }
+
+    // 3) object is a wallet->object map (very common)
+    // Example: { "0xabc": {...}, "0xdef": {...} }
+    const keys = Object.keys(data);
+    const looksLikeMap =
+      keys.length > 0 &&
+      keys.length <= 5000 &&
+      keys.every(k => normalizeWallet(k)) &&
+      keys.every(k => data[k] && typeof data[k] === "object" && !Array.isArray(data[k]));
+
+    if (looksLikeMap) {
+      const rows = keys.map(k => ({ wallet: k, ...data[k] }));
+      return { meta: {}, rows };
+    }
+
+    // 4) fallback: pick the largest array-of-objects among first-level props
+    let bestKey = null;
+    let bestLen = 0;
+    for (const [k, v] of Object.entries(data)) {
+      if (Array.isArray(v) && v.length > bestLen && (v.length === 0 || (v[0] && typeof v[0] === "object"))) {
+        bestKey = k;
+        bestLen = v.length;
+      }
+    }
+    if (bestKey) {
+      const meta = { ...data };
+      delete meta[bestKey];
+      return { meta, rows: data[bestKey] };
+    }
+  }
+
   return { meta: {}, rows: [] };
 }
+
 
 function inferColumns(rowsFlat){
   const freq = new Map();
@@ -330,7 +373,18 @@ function filteredSortedRows(){
 function renderRankTable(){
   const table = qs("rankTable");
   const rows = filteredSortedRows();
-
+  if (!state.rows.length) {
+    table.innerHTML = `
+      <thead><tr><th>Rankings</th></tr></thead>
+      <tbody><tr><td class="muted">
+        No rows parsed from this dataset file.<br/>
+        Your JSON may be a map (wallet→object) or use a different key than rows/data/items.<br/>
+        (The loader now supports map + auto-detect; refresh once after updating script.js)
+      </td></tr></tbody>
+    `;
+    qs("rankMeta").textContent = "(0 rows)";
+    return;
+  }
   const visible = state.visibleCols
     ? state.columns.filter(c => state.visibleCols.has(c))
     : state.columns;
@@ -899,20 +953,42 @@ async function loadDatasetById(id){
 
   const { meta, rows } = normalizeDatasetData(data);
 
-  state.rows = rows.map((r, i) => {
-    const flat = flatten(r);
-    const wallet = tryAddress(flat);
-    flat.__wallet = wallet;
-    flat.__rank = r.rank ?? r.__rank ?? (i + 1);
-    return flat;
-  }).filter(r => r.__wallet);
+  // Build flattened rows
+  const built = rows.map((r, i) => {
+    const base = (r && typeof r === "object") ? r : { value: r };
+    const flat = flatten(base);
 
+    // wallet from row fields
+    let wallet = tryAddress(flat);
+
+    // if still not found, try common direct keys on original object
+    if (!wallet && base) {
+      wallet = normalizeWallet(base.wallet) || normalizeWallet(base.address) || normalizeWallet(base.user);
+    }
+
+    flat.__wallet = wallet || ""; // keep row, even if wallet missing
+    flat.__rank   = base.rank ?? base.__rank ?? (i + 1);
+    return flat;
+  });
+
+  // If many rows have wallet missing, DON'T drop everything silently.
+  // Only filter out rows if they are totally unusable (no object + no wallet).
+  state.rows = built.filter(r => r && typeof r === "object");
+
+  // Columns inferred from full data
   state.columns = inferColumns(state.rows);
+
+  // restore visible columns
   state.visibleCols = loadVisibleColsFromStorage(state.datasetId, state.columns);
 
+  // meta display
   const metaParts = [];
   if (meta?.generatedAt) metaParts.push(`updated ${new Date(meta.generatedAt).toLocaleString()}`);
   if (meta?.count) metaParts.push(`count ${meta.count}`);
+
+  const walletCount = state.rows.filter(r => r.__wallet).length;
+  metaParts.push(`wallets ${walletCount}/${state.rows.length}`);
+
   qs("rankMeta").textContent = metaParts.length ? `(${metaParts.join(" • ")})` : "";
 
   renderRankTable();
