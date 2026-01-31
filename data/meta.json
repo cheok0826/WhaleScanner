@@ -1,6 +1,6 @@
 {
-  "generated_at_utc": "2026-01-31T07:47:55.849638+00:00",
-  "generated_at_epoch_ms": 1769845675849,
+  "generated_at_utc": "2026-01-31T08:09:17.665790+00:00",
+  "generated_at_epoch_ms": 1769846957665,
   "active_days": 14,
   "min_value": 500000.0,
   "source": {
@@ -11,12 +11,24 @@
     "pnl_pct_and_growth_pct_are_approx": true,
     "reason": "Computed from portfolio accountValueHistory/pnlHistory deltas divided by start account value."
   },
-  "failed_states": [],
+  "failed_states": [
+    "0x9a37179a2b2bacd9ff229e8c31f9b7bb34e36a9c",
+    "0x102467338792d8125d05856c4b4b43117c857fe3",
+    "0x0dad16bc8a7e3312b186bcc99c28718161c98ba1",
+    "0x06bc596fb16734f7abc3a5996b580be932c2fb72",
+    "0xf1c0dab1ff187f1dc13482cb675f54b8be362a5c",
+    "0x7da85a334e43a6b1c2c0da9623409d9ee9047747",
+    "0xd8592afc09c864df215d8012122aed08e4ae453f",
+    "0xedbeeb29869daa48bcf3ee214a48678bae7ce13a",
+    "0x86fc866d29d7446ff01ca0e45c528b61ac6466f7",
+    "0x1700acdd94010de35087b45b601d0e1b90c2697f"
+  ],
   "failed_fills": [
-    "0x469e9a7f624b04c24f0e64edf8d8a277e6bf58a5",
-    "0x4331ca6ff2e4a342244a4b8bec962a43cbeb0b57",
-    "0x267a8c44b6df09e632fe4c2f1f0f59788791c0f9",
-    "0x064e89061ce80cb1b41a2d2963d48d2e8cabde4a"
+    "0x350e33a777d510616fbdb483d1de3b50d1edfcfb",
+    "0x7fdafde5cfb5465924316eced2d3715494c517d1",
+    "0x17c3c8fdbcb7d1b240ce08965e09b1fc91cba868",
+    "0x89da4baec446f35a1cbe17a9d1ee5c70b05ee43f",
+    "0x720a68bf0813853cd3ed74d2fd0f54edfc7a43e1"
   ],
   "files": [
     "active_all.json",
