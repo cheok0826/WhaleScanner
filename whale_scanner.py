@@ -459,12 +459,23 @@ def extract_positions(state: Dict[str, Any], account_value: float, mids: Dict[st
 
 
 def last_trade_time_from_fills(fills: Optional[List[Dict[str, Any]]]) -> Optional[datetime]:
+    # FIX: don’t assume fills are sorted; take max timestamp
     if not fills:
         return None
-    t_ms = fills[0].get("time")
-    if t_ms is None:
+    best: Optional[int] = None
+    for f in fills:
+        t_ms = f.get("time")
+        if t_ms is None:
+            continue
+        try:
+            t_int = int(t_ms)
+        except Exception:
+            continue
+        if best is None or t_int > best:
+            best = t_int
+    if best is None:
         return None
-    return datetime.fromtimestamp(int(t_ms) / 1000, tz=timezone.utc)
+    return datetime.fromtimestamp(best / 1000, tz=timezone.utc)
 
 
 def infer_position_ages_from_fills(fills: List[Dict[str, Any]], positions: List[PositionView]) -> Dict[str, float]:
@@ -520,14 +531,27 @@ def infer_position_ages_from_fills(fills: List[Dict[str, Any]], positions: List[
 
 
 def parse_portfolio_windows(portfolio_resp: Any) -> Dict[str, Dict[str, Any]]:
+    """
+    portfolio response is typically: [ [window, {accountValueHistory, pnlHistory, vlm}], ... ]
+    Windows include: day/week/month/allTime and perpDay/perpWeek/perpMonth/perpAllTime.
+    Values are strings. Volume key is `vlm`. (We keep output key name `volume` unchanged.)
+    """
     out: Dict[str, Dict[str, Any]] = {}
-    if not isinstance(portfolio_resp, list):
+
+    # Accept either list-of-tuples OR dict mapping (defensive)
+    items: List[Tuple[str, Any]] = []
+    if isinstance(portfolio_resp, list):
+        for item in portfolio_resp:
+            if isinstance(item, (list, tuple)) and len(item) == 2 and isinstance(item[0], str):
+                items.append((item[0], item[1]))
+    elif isinstance(portfolio_resp, dict):
+        for k, v in portfolio_resp.items():
+            if isinstance(k, str):
+                items.append((k, v))
+    else:
         return out
 
-    for item in portfolio_resp:
-        if not (isinstance(item, (list, tuple)) and len(item) == 2):
-            continue
-        window, data = item
+    for window, data in items:
         if not isinstance(window, str) or not isinstance(data, dict):
             continue
 
@@ -546,41 +570,93 @@ def parse_portfolio_windows(portfolio_resp: Any) -> Dict[str, Dict[str, Any]]:
                 if isinstance(p, list) and len(p) == 2:
                     pnl_points.append((int(p[0]), to_float(p[1], 0.0)))
 
-        out[window] = {"account_values": av_points, "pnls": pnl_points, "volume": to_float(data.get("volume"), 0.0)}
+        # FIX: Hyperliquid uses `vlm` (string). Keep output key name `volume`.
+        vol_raw = data.get("vlm")
+        if vol_raw is None:
+            vol_raw = data.get("volume")  # fallback if any mirror uses different key
+
+        out[window] = {"account_values": av_points, "pnls": pnl_points, "volume": to_float(vol_raw, 0.0)}
+
+    # Optional aliasing: if allTime missing but perpAllTime exists, expose under allTime
+    # (does NOT change your JSON schema; it only helps avoid empty allTime in edge cases)
+    if "allTime" not in out and "perpAllTime" in out:
+        out["allTime"] = out["perpAllTime"]
+
     return out
 
 
-def window_return_metrics(win: Dict[str, Any]) -> Dict[str, Optional[float]]:
+def window_return_metrics(win: Dict[str, Any], baseline_eps: float = 1e-9) -> Dict[str, Optional[float]]:
+    """
+    FIX: Hyperliquid accountValueHistory can start at 0.0 (strings) — dividing by the first point yields null.
+    We compute growth/pnl% using the first positive baseline value instead, preserving output keys.
+    """
     av = win.get("account_values") or []
     pnls = win.get("pnls") or []
+
     if not av or len(av) < 2:
         return {"growth_pct": None, "pnl_pct": None, "vol_pct_daily": None, "max_drawdown_pct": None}
 
-    av_vals = [v for _, v in av]
-    start_av = av_vals[0]
-    end_av = av_vals[-1]
-    growth_pct = ((end_av - start_av) / start_av * 100.0) if start_av > 0 else None
+    # Ensure chronological order
+    av_sorted = sorted(((int(ts), float(v)) for ts, v in av), key=lambda x: x[0])
+    av_vals = [v for _, v in av_sorted]
 
-    pnl_pct = None
-    if pnls and len(pnls) >= 2 and start_av > 0:
-        start_pnl = pnls[0][1]
-        end_pnl = pnls[-1][1]
-        pnl_pct = (end_pnl - start_pnl) / start_av * 100.0
+    # Find first usable (positive) baseline
+    base_idx: Optional[int] = None
+    for i, v in enumerate(av_vals):
+        if math.isfinite(v) and v > baseline_eps:
+            base_idx = i
+            break
 
-    rets: List[float] = []
-    for i in range(1, len(av_vals)):
-        prev = av_vals[i - 1]
-        cur = av_vals[i]
-        if prev > 0:
-            rets.append((cur - prev) / prev)
+    # Compute vol + drawdown ignoring leading zeros / invalids
+    slice_start = base_idx if base_idx is not None else 0
+    av_slice = [v for v in av_vals[slice_start:] if math.isfinite(v)]
 
-    vol = stdev(rets)
-    vol_pct_daily = vol * 100.0 if vol is not None else None
+    vol_pct_daily: Optional[float] = None
+    if len(av_slice) >= 2:
+        rets: List[float] = []
+        for i in range(1, len(av_slice)):
+            prev = av_slice[i - 1]
+            cur = av_slice[i]
+            if prev > baseline_eps:
+                rets.append((cur - prev) / prev)
+        vol = stdev(rets) if len(rets) >= 2 else None
+        vol_pct_daily = (vol * 100.0) if vol is not None else None
 
-    mdd = max_drawdown(av_vals)
-    max_drawdown_pct = mdd * 100.0 if mdd is not None else None
+    mdd = max_drawdown(av_slice) if len(av_slice) >= 2 else None
+    max_drawdown_pct = (mdd * 100.0) if mdd is not None else None
 
-    return {"growth_pct": growth_pct, "pnl_pct": pnl_pct, "vol_pct_daily": vol_pct_daily, "max_drawdown_pct": max_drawdown_pct}
+    growth_pct: Optional[float] = None
+    pnl_pct: Optional[float] = None
+
+    # Compute growth/pnl% vs baseline (first positive av)
+    if base_idx is not None and base_idx < len(av_vals) - 1:
+        base_ts, base_av = av_sorted[base_idx]
+        end_av = av_vals[-1]
+
+        if base_av > baseline_eps:
+            growth_pct = (end_av - base_av) / base_av * 100.0
+
+            if pnls and len(pnls) >= 2:
+                pnls_sorted = sorted(((int(ts), float(v)) for ts, v in pnls), key=lambda x: x[0])
+                end_pnl = pnls_sorted[-1][1]
+
+                # Align baseline pnl to first pnl sample at/after baseline time
+                base_pnl: Optional[float] = None
+                for ts, pv in pnls_sorted:
+                    if ts >= base_ts:
+                        base_pnl = pv
+                        break
+                if base_pnl is None:
+                    base_pnl = pnls_sorted[0][1]
+
+                pnl_pct = (end_pnl - base_pnl) / base_av * 100.0
+
+    return {
+        "growth_pct": growth_pct,
+        "pnl_pct": pnl_pct,
+        "vol_pct_daily": vol_pct_daily,
+        "max_drawdown_pct": max_drawdown_pct,
+    }
 
 
 def risk_score(account_value: float, positions: List[PositionView]) -> float:
@@ -650,7 +726,6 @@ def extract_addresses_from_leaderboard(lb: Any, top_n: int) -> List[str]:
 
     return dedupe_keep_order(out)
 
-from typing import Any, Dict, List, Optional
 
 def compute_rank_scores(wallet: Dict[str, Any]) -> Dict[str, float]:
     r = float(wallet.get("risk_score") or 0.0)
@@ -676,7 +751,7 @@ def compute_rank_scores(wallet: Dict[str, Any]) -> Dict[str, float]:
     mdd = float(m.get("max_drawdown_pct") or 0.0)
     stability = max(0.0, 100.0 - (vol * 10.0) - (mdd * 2.0))
 
-    # ---- FIX: ensure ages is List[float], never contains None/Unknown
+    # ensure ages is List[float], never contains None/Unknown
     positions = wallet.get("positions") or []
     ages: List[float] = []
     if isinstance(positions, list):
@@ -691,6 +766,7 @@ def compute_rank_scores(wallet: Dict[str, Any]) -> Dict[str, float]:
     conviction = (avg_age * 2.0) + (exposure * 0.5) - (r * 0.5)
 
     return {"risk": r, "pnl": pnl, "stability": stability, "conviction": conviction}
+
 
 def apply_ranks(wallets: List[Dict[str, Any]]) -> None:
     for w in wallets:
@@ -906,9 +982,11 @@ def main() -> int:
             addr = w["address"]
             pr = client.portfolio(addr)
             wins = parse_portfolio_windows(pr) if pr is not None else {}
+
             month = window_return_metrics(wins.get("month", {})) if "month" in wins else None
             week = window_return_metrics(wins.get("week", {})) if "week" in wins else None
             all_time = window_return_metrics(wins.get("allTime", {})) if "allTime" in wins else None
+
             w["portfolio"] = {"month": month, "week": week, "allTime": all_time}
 
             if i % 20 == 0 or i == len(wallets):
