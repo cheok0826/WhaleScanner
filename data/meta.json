@@ -1,6 +1,6 @@
 {
-  "generated_at_utc": "2026-03-07T04:24:16.304431+00:00",
-  "generated_at_epoch_ms": 1772857456304,
+  "generated_at_utc": "2026-03-07T05:20:21.935832+00:00",
+  "generated_at_epoch_ms": 1772860821935,
   "active_days": 14,
   "min_value": 500000.0,
   "source": {
@@ -12,10 +12,7 @@
     "reason": "Computed from portfolio accountValueHistory/pnlHistory deltas divided by start account value."
   },
   "failed_states": [],
-  "failed_fills": [
-    "0x1ee7a73cb5b0b6b056d8138085b2009e6a6bedf5",
-    "0x07fd7e702ba749ffa49c3a6c17fcd9e6c7b7082a"
-  ],
+  "failed_fills": [],
   "files": [
     "active_all.json",
     "active_risk.json",
