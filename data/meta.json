@@ -1,6 +1,6 @@
 {
-  "generated_at_utc": "2026-04-07T16:06:21.254130+00:00",
-  "generated_at_epoch_ms": 1775577981254,
+  "generated_at_utc": "2026-04-07T17:15:19.805465+00:00",
+  "generated_at_epoch_ms": 1775582119805,
   "active_days": 14,
   "min_value": 500000.0,
   "source": {
@@ -17,7 +17,10 @@
     "0xedf2b293d5b358f17330c8412e0be36feaa8fc0b",
     "0xae7a0f9f663bb54bfe95378c7e3de7dd6e28d6bc",
     "0xd6e1a6f7bb47aca69aaa511210227d40926ff256",
-    "0x936cf4fb95c30ce83f658b5bbb247e4bb381bb0f"
+    "0x936cf4fb95c30ce83f658b5bbb247e4bb381bb0f",
+    "0x0b8aa35c28b7c6ab18f11dc168f437a8a69fd4f8",
+    "0xadd12adbbd5db87674b38af99b6dd34dd2a45e0d",
+    "0xe86351e0f69bd808def36e7bb2f9107443838bb8"
   ],
   "files": [
     "active_all.json",
