@@ -1,6 +1,6 @@
 {
-  "generated_at_utc": "2026-09-29T07:06:22.879204+00:00",
-  "generated_at_epoch_ms": 1790665582879,
+  "generated_at_utc": "2026-09-29T14:04:24.355875+00:00",
+  "generated_at_epoch_ms": 1790690664355,
   "active_days": 14,
   "min_value": 500000.0,
   "source": {
@@ -13,16 +13,17 @@
   },
   "failed_states": [],
   "failed_fills": [
-    "0x62f82c3ef1da6093118fadb29090c4e3263f02e6",
-    "0x61ceef212ff4a86933c69fb6aca2fe35d8f2a62b",
-    "0x9321d8117e73b0c79035f0e87debcfd8dbb1d75a",
-    "0x8eff8ff863c1a54ec6697b7ad98fe30aa344bd5e",
-    "0x47472cd62c99b8b5ce7e84e733515133e9aec0bd",
+    "0xb48e45c76e7442d9944790085399e26b7d89b1ed",
+    "0xedcdcaa1f18350c50c10bef860e64daa9785d05a",
+    "0x31ca8395cf837de08b24da3f660e77761dfb974b",
+    "0x5b5d51203a0f9079f8aeb098a6523a13f298c060",
+    "0x7e1ad5e2bbe30d6d202e7c41036ea0a07c560be9",
+    "0xf517639a8872e756ac98d3c65507d2ebc25cc032",
     "0x362ad6209a5e904a5569f69884375809c5781d9f",
     "0x734531e87f8c1643321355f7143fcc6169c4b404",
-    "0xdf954bbe619273a56e0cfa90dad8382195dc7d72",
     "0xd6e1a6f7bb47aca69aaa511210227d40926ff256",
-    "0x482b0f4dad512fe086e121882a81e34c374acae4"
+    "0x0eba880f6be60142c70019d2dd46c49c47204eea",
+    "0x519c721de735f7c9e6146d167852e60d60496a47"
   ],
   "files": [
     "active_all.json",
